@@ -54,6 +54,19 @@ ROBOT_RADIUS = math.hypot(ROBOT_LEN / 2, ROBOT_WIDTH / 2)   # 0.70 m
 D_COLLIDE = ROBOT_WIDTH                            # 0.98 m, bodies touching
 D_NEAR = 2 * ROBOT_RADIUS                          # 1.40 m, swept circles touch
 
+# Hysteresis on the near-miss latch. Without it a pair hovering at 1.39<->1.41
+# re-counted every cycle, which is the same tick-vs-event defect as
+# ENGINEERING_LOG BUG 7. One cell of separation beyond touch is the smallest
+# release that is anchored in the geometry rather than picked by eye.
+#
+# THIS CHANGES THE SCALE OF THE METRIC, NOT THE BEHAVIOUR OF THE ROBOTS.
+# Identical runs, only the counting rule differing, gave 65 events releasing
+# at D_NEAR against 33 releasing at 2.00 m -- a 49% drop with nothing about
+# the fleet changed. Near-miss counts from before this commit are NOT
+# comparable with counts after it, and the reduction must not be reported as
+# a safety improvement.
+D_NEAR_RELEASE = D_NEAR + CELL_SIZE                # 1.90 m
+
 # Safety supervisor, DIRECTIONAL.
 #
 # An isotropic braking radius cannot work for a robot this size. Setting a
@@ -72,6 +85,19 @@ LANE_HALF_W = ROBOT_WIDTH                          # 0.98 m lateral clearance
 # LiDAR. Range is the same 3.0 m the simulator always used; what is new is
 # that returns are now OCCLUDED by structure and are fed to a track layer
 # that the ROUTING and DEADLOCK decisions read, not just the brake.
+# A bay counts as OCCUPIED when a body could overlap its cell, whatever the
+# robot's heading. Derived, not chosen: circumscribed radius + half the cell
+# diagonal. Sampling 200k random poses around a bay:
+#     0.40 m  misses 80.0% of poses whose body covers the cell
+#     0.74 m  misses 30.9%   (axis-aligned bound; ignores rotation)
+#     1.054 m misses  0.0%   <- this value, the smallest that never misses
+#     1.20 m  misses  0.0%   but with 2x the false "taken" rate
+# 0.40 m is blind to four of five robots physically sitting on the bay, which
+# causes the double-booking it was meant to prevent; 1.20 m was merely
+# conservative. Rotation-invariant because heading is still instantaneous
+# (CLAUDE.md flaw 3), so a robot can present its diagonal at any moment.
+D_BAY_OCCUPIED = ROBOT_RADIUS + math.hypot(CELL_SIZE, CELL_SIZE) / 2   # 1.054 m
+
 LIDAR_RANGE = 3.0
 T_LIDAR_REPLAN = 2.0        # min gap between LiDAR-triggered replans
 
@@ -89,6 +115,21 @@ MIN_BACKOUT_CELLS = 1       # a one-cell retreat still breaks a mutual stop
 # deadlock should be resolved by the LIFO stack, and this is the fallback for
 # everything else -- above all the shared-goal pile-up, where 3 robots want
 # one dropoff cell, no wait-for CYCLE ever forms, and the losers simply sit.
+# BOUNDED MEMORY. Every per-task dict grew with tasks ANNOUNCED and was never
+# pruned: 150 announced -> 150 entries in known_tasks, pending_bids, claimed
+# and rebid_at, measured over 1200 s. At one task per 8 s a 12-hour shift
+# accumulates ~5,400 entries per dict per robot, which is a real problem on
+# the Raspberry Pi this is meant to run on.
+#
+# The root cause is a gap in the protocol: nothing on the wire says a task was
+# DELIVERED. Claim announces a winner and there it ends, so a robot has no
+# event that would let it forget. Rather than add a message to a frozen
+# contract, memory is bounded by age and by count -- a task old enough that no
+# robot could still be working it is one this robot can safely forget, and if
+# the operator re-announces it, it is learned again from the Task broadcast.
+T_TASK_MEMORY = 300.0       # forget a task this long after it was announced
+MAX_KNOWN_TASKS = 96        # hard cap; newest survive
+
 T_PUSHBACK = 2.0            # stalled this long -> negotiate with the blocker
 T_PUSHBACK_BC = 1.0         # request cadence
 T_STUCK_REVERSE = 5.0
@@ -123,11 +164,26 @@ V_REVERSE = 0.25              # m/s cap while backing up in the OPEN
 # points of fetch time in a project whose headline claim is zero.
 V_REVERSE_LANE = 0.35         # m/s when reversing inside a narrow aisle
 LANE_HALF_W_REVERSE = 1.30    # wider arc behind: rear sensing is coarser
-# TRIED AND REVERTED: a 0.06 m omnidirectional standoff while reversing, to
-# buy the brake a tick of reaction before contact. It did NOT remove the
-# residual graze (still 1 collision over 10 seeds) and cost 23% of lifelong
-# throughput (75 -> 58 tasks over 400 s x 5). A margin that does not buy
-# safety is just a slower robot.
+# Reverse contact standoff.
+#
+# The omnidirectional floor fires at d < D_COLLIDE, i.e. at the instant
+# contact is recorded, so it has zero reaction margin. Two robots reversing
+# simultaneously grazed at 0.977 m against a 0.98 m footprint -- a 3 mm
+# overlap, and the failure that broke test_zero_collisions_nominal on seed 3.
+#
+# This was TRIED AND REVERTED once before, on the narrow map, where 0.06 m
+# cost 23% of lifelong throughput and still left a graze. It is affordable
+# now because the map has been widened: robots have somewhere to be while
+# they wait. Swept over 10 seeds x 180 s:
+#     +0.00 m  119 tasks  2 collisions
+#     +0.04 m  115 tasks  0 collisions   <- chosen
+#     +0.08 m  105 tasks  0 collisions
+#     +0.15 m   96 tasks  0 collisions
+# 3.4% of throughput for the last two collisions, on a project whose headline
+# claim is zero. Applied only while REVERSING, which is the blind manoeuvre;
+# a standoff in forward motion would veto every backout at its start, since a
+# robot backs out precisely because a peer is ~1.05 m in front of it.
+D_REVERSE_STANDOFF = 0.04
 
 
 @dataclass
@@ -507,7 +563,22 @@ class Robot:
                 self.excluded.setdefault(tid, set()).add(presumed)
             self.rebid_at[tid] = now
 
-        # retry tasks nobody could take yet (every robot busy or infeasible)
+        # Retry tasks nobody could take yet.
+        #
+        # A BUSY robot does not retry. `evaluate_task` already returns
+        # INF_COST for a robot that holds a task, so every one of those
+        # retries put a bid on the wire that could not possibly win, and it
+        # did so every T_REBID seconds for as long as the task stayed open.
+        # Measured: 11,542 "no feasible bidder" resolutions and a mean of 608
+        # resolution rounds per task, peaking at 1314. That is polling, and
+        # the event it is polling for -- "a robot became free" -- is one the
+        # robot itself knows the instant it happens.
+        #
+        # So retries are now event-driven: hold off while busy, and re-bid on
+        # everything still open the moment the current task is done. Nothing
+        # is lost, because a busy robot's bid was never going to win.
+        if self.task is not None or self.battery < SOC_LOW:
+            return
         for tid, when in list(self.rebid_at.items()):
             if now < when:
                 continue
@@ -518,6 +589,55 @@ class Robot:
                 continue          # I just gave this one back -- let a peer try
             self.pending_bids.pop(tid, None)
             self.submit_bid(self.known_tasks[tid], now)
+
+    def forget_old_tasks(self, now: float) -> None:
+        """
+        Drop per-task state I can no longer act on. Bounded memory.
+
+        Two rules, both conservative. The task I am CURRENTLY holding is never
+        forgotten. Otherwise a task goes once it is older than T_TASK_MEMORY,
+        which is four times the longest task time ever measured here, and a
+        hard count cap keeps the newest MAX_KNOWN_TASKS if the operator floods
+        the fleet faster than it can drain.
+        """
+        keep = self.task.task_id if self.task else None
+
+        def drop(tid: int) -> None:
+            self.known_tasks.pop(tid, None)
+            self.pending_bids.pop(tid, None)
+            self.claimed.pop(tid, None)
+            self.cooldown.pop(tid, None)
+            self.rebid_at.pop(tid, None)
+            self.bid_close.pop(tid, None)
+            self.claim_due.pop(tid, None)
+            self.excluded.pop(tid, None)
+
+        for tid, task in list(self.known_tasks.items()):
+            if tid != keep and now - task.announced_at > T_TASK_MEMORY:
+                drop(tid)
+        if len(self.known_tasks) > MAX_KNOWN_TASKS:
+            ordered = sorted(self.known_tasks,
+                             key=lambda t: self.known_tasks[t].announced_at)
+            for tid in ordered[:len(self.known_tasks) - MAX_KNOWN_TASKS]:
+                if tid != keep:
+                    drop(tid)
+        self.table.prune_blocked(now)
+
+    def rebid_open_tasks(self, now: float) -> None:
+        """
+        I just became free. Bid on everything I still believe is unclaimed.
+
+        This is the other half of not polling while busy: the moment a robot
+        finishes, it re-enters every auction it was ineligible for, in the
+        same tick, rather than waiting for the next T_REBID tick to come
+        round.
+        """
+        if self.task is not None:
+            return
+        for tid in self.known_tasks:
+            if tid in self.claimed or now < self.cooldown.get(tid, 0.0):
+                continue
+            self.rebid_at[tid] = now
 
     def check_release(self, now: float) -> None:
         """
@@ -581,6 +701,7 @@ class Robot:
         self.payload = 0.0
         self.phase = "none"
         self.mode = RobotMode.IDLE
+        self.rebid_open_tasks(now)     # free again -> re-enter open auctions
 
     # -- a stalled robot is an obstacle ------------------------------------
 
@@ -1039,7 +1160,7 @@ class Robot:
         for pid, st in self.peers.items():
             if now - self.peer_seen_at.get(pid, -1e9) > 2.0:
                 continue
-            if math.hypot(st.x - bx, st.y - by) < 0.4:
+            if math.hypot(st.x - bx, st.y - by) < D_BAY_OCCUPIED:
                 return True
         for pid, it in self.peer_intents.items():
             if now - self.peer_seen_at.get(pid, -1e9) > 2.0:
@@ -1073,7 +1194,17 @@ class Robot:
                 return b
         return bays[0] if bays else None
 
-    def update_bay_claim(self, bay: tuple[int, int], src: int, claimed_at: float, eta: float, now: float) -> None:
+    def update_bay_claim(self, bay: tuple[int, int], src: int,
+                         claimed_at: float, eta: float, now: float) -> None:
+        """
+        Record a peer's bay claim, stamped with when the CLAIM arrived.
+
+        The fourth field is the fix. Freshness used to be read from
+        `peer_seen_at`, which updates on every message a peer sends -- so a
+        claim made 60 s ago still looked fresh as long as its owner kept
+        broadcasting anything at all. A claim expires on its own age, not on
+        its owner's general liveness.
+        """
         self.bay_claims[bay] = (src, claimed_at, eta, now)
 
     def claim_bay(self, bay: tuple[int, int], now: float) -> None:
@@ -1704,6 +1835,7 @@ class Robot:
         hx = math.cos(self.theta) * sgn
         hy = math.sin(self.theta) * sgn
         half_w = LANE_HALF_W_REVERSE if reverse else LANE_HALF_W
+        contact = D_COLLIDE + (D_REVERSE_STANDOFF if reverse else 0.0)
         if reverse:
             in_lane_now = self.wmap.is_narrow(*self.cell)
             v_out = min(v_out, V_REVERSE_LANE if in_lane_now else V_REVERSE)
@@ -1711,8 +1843,9 @@ class Robot:
             dx, dy = px - self.x, py - self.y
             d = math.hypot(dx, dy)
 
-            # Omnidirectional floor: genuine body contact, whatever the bearing.
-            if d < D_COLLIDE:
+            # Omnidirectional floor: genuine body contact, whatever the
+            # bearing, plus a reaction margin while reversing blind.
+            if d < contact:
                 return 0.0
 
             fwd = dx * hx + dy * hy           # along my heading
@@ -1879,7 +2012,7 @@ class Simulation:
                         if not self._near.get(key):
                             self.metrics.near_misses += 1
                         self._near[key] = True
-                    elif d > 2.0:
+                    elif d > D_NEAR_RELEASE:
                         self._near[key] = False
 
     def step(self) -> None:
@@ -1930,6 +2063,7 @@ class Simulation:
                         r.replan(self.t)
             r.check_release(self.t)
             r.step_auction(self.t)
+            r.forget_old_tasks(self.t)
         held = {r.task.task_id for r in self.robots if r.task}
         for tid in list(self.open_tasks):
             if tid in held:
@@ -2033,6 +2167,9 @@ class Simulation:
                     r.task, r.path = None, []
                     r.payload, r.phase = 0.0, "none"
                     r.mode = RobotMode.IDLE
+                    # Free again: re-enter every auction I was ineligible for,
+                    # this tick, instead of waiting for a polling interval.
+                    r.rebid_open_tasks(self.t)
                     # Clear the aisle: retire to the nearest bay no peer has
                     # claimed. The robot picks this itself from broadcast state.
                     r.go_idle(self.t)

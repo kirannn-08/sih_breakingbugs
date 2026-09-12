@@ -77,6 +77,20 @@ class ReservationTable:
                      confidence: float = 1.0) -> None:
         self._blocked[(cx, cy)] = (confidence, now)
 
+    def prune_blocked(self, now: float) -> None:
+        """
+        Drop blockage beliefs that have fully decayed.
+
+        `mark_blocked` only ever added, so the dict grew for the life of the
+        robot even though a belief is worthless once it reaches zero at
+        0.05/s. Removing a dead entry changes no decision -- blocked_belief
+        already returns 0.0 for it -- it just stops the table growing without
+        bound.
+        """
+        for cell, (conf, t) in list(self._blocked.items()):
+            if conf - 0.05 * (now - t) <= 0.0:
+                del self._blocked[cell]
+
     def blocked_belief(self, cx: int, cy: int, now: float) -> float:
         """Confidence decays 0.05/s so temporary obstructions self-clear."""
         e = self._blocked.get((cx, cy))
