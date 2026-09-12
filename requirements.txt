@@ -1,2 +1,3 @@
 numpy>=1.24
+tornado>=6.0     # dashboard_server.py only; sim + benchmark stay numpy-only
 pytest>=7.0      # tests only

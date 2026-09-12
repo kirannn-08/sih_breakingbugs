@@ -18,7 +18,7 @@ Models: range limit, packet loss, latency, dead zones, hard link cuts.
 from __future__ import annotations
 
 import random
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 
 from amr_msgs import LinkPacket, BROADCAST
@@ -62,6 +62,11 @@ class CommsMediator:
         self.delivered = 0
         self.dropped = 0
         self.bytes_sent = 0
+        # per-type counters -- the dashboard needs to show that Bid/Claim/
+        # Release actually travel, otherwise "decentralised auction" is a
+        # claim on a slide rather than something a judge can watch happen.
+        self.by_type: Counter = Counter()
+        self.bytes_by_type: Counter = Counter()
 
     # -- demo controls -----------------------------------------------------
 
@@ -83,7 +88,7 @@ class CommsMediator:
         for k in self.link_matrix:
             self.link_matrix[k] = True
 
-    def caut_everything(self) -> None:
+    def cut_everything(self) -> None:
         for k in self.link_matrix:
             self.link_matrix[k] = False
 
@@ -100,7 +105,10 @@ class CommsMediator:
 
     def send(self, pkt: LinkPacket, now: float) -> None:
         self.sent += 1
-        self.bytes_sent += pkt.size_bytes()
+        n = pkt.size_bytes()
+        self.bytes_sent += n
+        self.by_type[pkt.msg_type] += 1
+        self.bytes_by_type[pkt.msg_type] += n
         targets = [i for i in self.ids if i != pkt.src] \
             if pkt.dst == BROADCAST else [pkt.dst]
         for dst in targets:
@@ -146,6 +154,17 @@ class CommsMediator:
         return out
 
     def stats(self) -> dict:
+        """
+        loss_pct is per DELIVERY ATTEMPT, not per packet.
+
+        A broadcast to N-1 peers is one `sent` but N-1 attempts, so dividing
+        drops by `sent` overstated loss by (N-1)x -- it reported 62% for a
+        configured 20% at N=4, which flatters the resilience claim.
+        """
+        attempts = self.delivered + self.dropped
         return {"sent": self.sent, "delivered": self.delivered,
                 "dropped": self.dropped, "bytes": self.bytes_sent,
-                "loss_pct": round(100 * self.dropped / max(1, self.sent), 2)}
+                "attempts": attempts,
+                "loss_pct": round(100 * self.dropped / max(1, attempts), 2),
+                "by_type": dict(self.by_type),
+                "bytes_by_type": dict(self.bytes_by_type)}

@@ -293,15 +293,37 @@ class SimulationManager:
             # S1: Decentralized task allocation
             self.reset(seed=1)
             t = self.broadcast_random_task()
-            self.step()  # let robots receive task & submit bids
-            bids = {}
-            for r in self.sim.robots:
-                cost, feas = r.evaluate_task(t, self.sim.t)
-                bids[r.id] = (cost, feas)
-            winner = resolve_auction(bids)
-            msg = f"Decentralized auction resolved: Winner AMR {winner} with bid {bids[winner][0]:.2f}. Zero central auctioneer."
-            self.log_event("AUCTION", msg, "success", {"bids": bids, "winner": winner})
-            return {"status": "ok", "scenario": 1, "message": msg, "winner": winner, "bids": bids}
+            # Let the robots run the auction THEMSELVES: broadcast Bid, wait
+            # T_BID, resolve locally, winner broadcasts Claim. Do NOT recompute
+            # it here -- calling evaluate_task() on every robot and resolving
+            # centrally is exactly the auctioneer this architecture removed,
+            # and reporting its answer as "decentralised" would be false.
+            for _ in range(12):                      # ~1.2 s > T_BID + T_CLAIM
+                self.step()
+                if any(r.task and r.task.task_id == t.task_id
+                       for r in self.sim.robots):
+                    break
+
+            winner = next((r.id for r in self.sim.robots
+                           if r.task and r.task.task_id == t.task_id), 0)
+            # what each robot independently believes, and what it bid
+            beliefs = {r.id: r.claimed.get(t.task_id, 0) for r in self.sim.robots}
+            bids = {r.id: round(b[r.id][0], 2)
+                    for r in self.sim.robots
+                    if (b := r.pending_bids.get(t.task_id)) and r.id in b
+                    and b[r.id][1]}
+            agree = len({v for v in beliefs.values() if v}) <= 1
+            msg = (f"Task #{t.task_id} won by AMR {winner} through peer-to-peer "
+                   f"bidding. {self.sim.comms.stats()['by_type'].get('BID', 0)} Bid "
+                   f"and {self.sim.comms.stats()['by_type'].get('CLAIM', 0)} Claim "
+                   f"messages crossed the radio. "
+                   + ("All robots agree on the owner."
+                      if agree else "Robots DISAGREE -- split brain, resolving by lowest id."))
+            self.log_event("AUCTION", msg, "success" if agree else "warning",
+                           {"bids": bids, "winner": winner, "beliefs": beliefs})
+            return {"status": "ok", "scenario": 1, "message": msg,
+                    "winner": winner, "bids": bids, "beliefs": beliefs,
+                    "consensus": agree}
 
         elif scenario_id == 2:
             # S2: Speed adaptation
@@ -396,7 +418,28 @@ class SimulationManager:
                 "stopped_time": round(r.stopped_time, 2),
                 "dist": round(r.dist, 2),
                 "replans": r.replans,
-                "peers_heard": list(r.peers.keys()),
+                # FRESH peers only. Robot.peers is never pruned, so the raw
+                # dict still lists every peer ever heard -- during a blackout
+                # demo that reads as "peers_heard: [2,3,4]" on a fleet with
+                # every link cut, which is a contradiction on screen. 2.0 s
+                # matches the window check_degraded() uses.
+                "peers_heard": sorted(pid for pid, seen in r.peer_seen_at.items()
+                                      if sim.t - seen < 2.0),
+                "peers_known": sorted(r.peers.keys()),
+                # Decentralised auction state, as THIS robot sees it. Two
+                # robots may legitimately disagree under packet loss -- that
+                # disagreement is the thing worth showing, so never merge
+                # these into one fleet-wide view.
+                "auction": {
+                    "my_bids": {str(t): round(b[r.id][0], 2)
+                                for t, b in r.pending_bids.items()
+                                if r.id in b and b[r.id][1]},
+                    "bids_heard": {str(t): len(b) for t, b in r.pending_bids.items()},
+                    "claimed": {str(t): owner for t, owner in r.claimed.items()},
+                    "bid_windows_open": sorted(r.bid_close.keys()),
+                    "awaiting_claim": sorted(r.claim_due.keys()),
+                    "excluded": {str(t): sorted(v) for t, v in r.excluded.items() if v},
+                },
                 "reservations": res_list
             })
 
@@ -448,6 +491,7 @@ class SimulationManager:
                 "loss_rate": sim.comms.loss_rate,
                 "stats": sim.comms.stats()
             },
+            "auction": self._auction_summary(),
             "tasks": {
                 "open": open_tasks,
                 "active": active_tasks,
@@ -456,6 +500,43 @@ class SimulationManager:
             },
             "metrics": metrics_data,
             "events": self.events[-50:]  # Send latest 50 events in state update
+        }
+
+    def _auction_summary(self) -> dict[str, Any]:
+        """
+        Fleet-wide view of the CONSENSUS SEALED-BID AUCTION.
+
+        There is no auctioneer: each robot broadcasts a Bid, waits T_BID, and
+        resolves the winner over the bids it actually received. `consensus`
+        below counts tasks where every robot that has an opinion agrees on the
+        owner. Under packet loss it can drop below 100% -- that is the system
+        working honestly, not a bug, and it is the single most convincing
+        thing on this dashboard.
+        """
+        sim = self.sim
+        st = sim.comms.stats()
+        by_type = st.get("by_type", {})
+
+        opinions: dict[int, set[int]] = {}
+        for r in sim.robots:
+            for tid, owner in r.claimed.items():
+                opinions.setdefault(tid, set()).add(owner)
+        contested = sorted(t for t, o in opinions.items() if len(o) > 1)
+        agreed = len(opinions) - len(contested)
+
+        return {
+            "messages": {
+                "bid": by_type.get(MsgType.BID.value, 0),
+                "claim": by_type.get(MsgType.CLAIM.value, 0),
+                "release": by_type.get(MsgType.RELEASE.value, 0),
+                "robot_state": by_type.get(MsgType.ROBOT_STATE.value, 0),
+                "intent": by_type.get(MsgType.INTENT.value, 0),
+            },
+            "tasks_with_an_owner": len(opinions),
+            "agreed": agreed,
+            "contested": contested,
+            "consensus_pct": round(100.0 * agreed / max(1, len(opinions)), 1),
+            "has_auctioneer": False,
         }
 
     def get_map_data(self) -> dict[str, Any]:
@@ -516,63 +597,69 @@ class SimWebSocketHandler(tornado.websocket.WebSocketHandler):
     def on_message(self, message: str) -> None:
         try:
             cmd = json.loads(message)
-            action = cmd.get("action")
-
-            if action == "play":
-                MANAGER.is_running = True
-                MANAGER.log_event("SYSTEM", "Simulation started", "info")
-            elif action == "pause":
-                MANAGER.is_running = False
-                MANAGER.log_event("SYSTEM", "Simulation paused", "info")
-            elif action == "step":
-                MANAGER.step()
-                broadcast_state()
-            elif action == "reset":
-                seed = cmd.get("seed", MANAGER.seed)
-                MANAGER.reset(seed)
-                broadcast_state()
-            elif action == "set_speed":
-                MANAGER.speed_multiplier = float(cmd.get("value", 1.0))
-            elif action == "set_auto_tasks":
-                MANAGER.auto_tasks = bool(cmd.get("enabled", True))
-            elif action == "broadcast_task":
-                p = cmd.get("pickup", [8, 9])
-                d = cmd.get("dropoff", [2, 27])
-                w = float(cmd.get("payload_kg", 5.0))
-                pr = int(cmd.get("priority", 1))
-                MANAGER.broadcast_task(p[0], p[1], d[0], d[1], w, pr)
-                broadcast_state()
-            elif action == "cut_link":
-                MANAGER.cut_link(int(cmd["a"]), int(cmd["b"]))
-                broadcast_state()
-            elif action == "restore_link":
-                MANAGER.restore_link(int(cmd["a"]), int(cmd["b"]))
-                broadcast_state()
-            elif action == "isolate":
-                MANAGER.isolate_robot(int(cmd["robot_id"]))
-                broadcast_state()
-            elif action == "cut_all":
-                MANAGER.cut_all_links()
-                broadcast_state()
-            elif action == "restore_all":
-                MANAGER.restore_all_links()
-                broadcast_state()
-            elif action == "set_loss_rate":
-                MANAGER.set_loss_rate(float(cmd["rate"]))
-                broadcast_state()
-            elif action == "kill_server":
-                MANAGER.set_server_online(False)
-                broadcast_state()
-            elif action == "restore_server":
-                MANAGER.set_server_online(True)
-                broadcast_state()
-            elif action == "run_scenario":
-                res = MANAGER.run_scenario(int(cmd["scenario_id"]))
-                self.write_message(json.dumps({"type": "scenario_result", "data": res}))
-                broadcast_state()
+            res = dispatch_action(cmd)
+            if res.get("type") == "scenario_result":
+                self.write_message(json.dumps(res))
+            broadcast_state()
         except Exception as e:
             logger.error(f"Error handling websocket message: {e}")
             self.write_message(json.dumps({"type": "error", "error": str(e)}))
+
+
+def dispatch_action(cmd: dict[str, Any]) -> dict[str, Any]:
+    """
+    Single command vocabulary for BOTH the WebSocket and the REST endpoint.
+
+    Previously ActionHandler implemented only play/pause/step/reset and
+    returned {"status": "ok"} for everything else, so `cut_all`, `isolate`,
+    `set_loss_rate` and `run_scenario` over REST reported success and did
+    nothing. An unknown action now raises -- a control that silently does
+    nothing is worse on stage than one that errors.
+    """
+    action = cmd.get("action")
+
+    if action == "play":
+        MANAGER.is_running = True
+        MANAGER.log_event("SYSTEM", "Simulation started", "info")
+    elif action == "pause":
+        MANAGER.is_running = False
+        MANAGER.log_event("SYSTEM", "Simulation paused", "info")
+    elif action == "step":
+        MANAGER.step()
+    elif action == "reset":
+        MANAGER.reset(cmd.get("seed", MANAGER.seed))
+    elif action == "set_speed":
+        MANAGER.speed_multiplier = float(cmd.get("value", 1.0))
+    elif action == "set_auto_tasks":
+        MANAGER.auto_tasks = bool(cmd.get("enabled", True))
+    elif action == "broadcast_task":
+        p = cmd.get("pickup", [8, 9])
+        d = cmd.get("dropoff", [2, 27])
+        MANAGER.broadcast_task(p[0], p[1], d[0], d[1],
+                               float(cmd.get("payload_kg", 5.0)),
+                               int(cmd.get("priority", 1)))
+    elif action == "cut_link":
+        MANAGER.cut_link(int(cmd["a"]), int(cmd["b"]))
+    elif action == "restore_link":
+        MANAGER.restore_link(int(cmd["a"]), int(cmd["b"]))
+    elif action == "isolate":
+        MANAGER.isolate_robot(int(cmd["robot_id"]))
+    elif action == "cut_all":
+        MANAGER.cut_all_links()
+    elif action == "restore_all":
+        MANAGER.restore_all_links()
+    elif action == "set_loss_rate":
+        MANAGER.set_loss_rate(float(cmd["rate"]))
+    elif action == "kill_server":
+        MANAGER.set_server_online(False)
+    elif action == "restore_server":
+        MANAGER.set_server_online(True)
+    elif action == "run_scenario":
+        return {"type": "scenario_result",
+                "data": MANAGER.run_scenario(int(cmd["scenario_id"]))}
+    else:
+        raise ValueError(f"unknown action {action!r}")
+    return {"status": "ok", "action": action}
 
 
 def broadcast_state() -> None:
@@ -611,22 +698,18 @@ class BenchmarkHandler(tornado.web.RequestHandler):
 
 
 class ActionHandler(tornado.web.RequestHandler):
+    """REST mirror of the WebSocket command set -- same dispatcher, no drift."""
+
     def post(self) -> None:
         try:
-            body = json.loads(self.request.body)
-            action = body.get("action")
-            if action == "play":
-                MANAGER.is_running = True
-            elif action == "pause":
-                MANAGER.is_running = False
-            elif action == "step":
-                MANAGER.step()
-            elif action == "reset":
-                MANAGER.reset()
-            self.write(json.dumps({"status": "ok", "action": action}))
+            res = dispatch_action(json.loads(self.request.body))
+            self.write(json.dumps(res))
             broadcast_state()
-        except Exception as e:
+        except ValueError as e:
             self.set_status(400)
+            self.write(json.dumps({"error": str(e)}))
+        except Exception as e:
+            self.set_status(500)
             self.write(json.dumps({"error": str(e)}))
 
 
