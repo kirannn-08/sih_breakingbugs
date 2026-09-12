@@ -82,6 +82,31 @@ D_BLIND_LOOKAHEAD = 1.5     # m of path ahead scanned for a blind corner
 T_BLIND_REACT = 1.5         # s of peer travel to treat as 'could be there'
 SEG_TIE = 0.5               # entry times within this are a dead heat
 MIN_BACKOUT_CELLS = 1       # a one-cell retreat still breaks a mutual stop
+# Reverse as a general un-sticking tool, not only as deadlock recovery.
+# Longer than T_OBSTACLE so cycle detection gets first refusal: a genuine
+# deadlock should be resolved by the LIFO stack, and this is the fallback for
+# everything else -- above all the shared-goal pile-up, where 3 robots want
+# one dropoff cell, no wait-for CYCLE ever forms, and the losers simply sit.
+T_STUCK_REVERSE = 5.0
+T_REVERSE_COOLDOWN = 8.0    # don't re-reverse immediately and oscillate
+
+# Reversing is the blind manoeuvre, and it was being done at full speed into
+# a region the robot cannot see well. All three residual collisions were a
+# robot reversing at 0.800 m/s into a stationary peer on a DIAGONAL bearing,
+# which slipped outside the forward lane width.
+#
+# Real AMRs reverse slowly for exactly this reason, and they watch a wider
+# arc behind than in front. The rear cone must stay a cone and not become
+# omnidirectional, though: a robot backs out precisely BECAUSE a peer is
+# ~1.05 m in front of it, so an all-round hard stop would veto every backout
+# at the instant it started and re-freeze the fleet.
+V_REVERSE = 0.25              # m/s cap while backing up
+LANE_HALF_W_REVERSE = 1.30    # wider arc behind: rear sensing is coarser
+# TRIED AND REVERTED: a 0.06 m omnidirectional standoff while reversing, to
+# buy the brake a tick of reaction before contact. It did NOT remove the
+# residual graze (still 1 collision over 10 seeds) and cost 23% of lifelong
+# throughput (75 -> 58 tasks over 400 s x 5). A margin that does not buy
+# safety is just a slower robot.
 
 
 @dataclass
@@ -111,6 +136,7 @@ class Metrics:
     waits_executed: int = 0
     risk_deferrals: int = 0
     yield_skips: int = 0
+    stuck_reverses: int = 0
     collision_ticks: int = 0
     near_miss_ticks: int = 0
 
@@ -143,6 +169,7 @@ class Metrics:
             "waits_executed": self.waits_executed,
             "risk_deferrals": self.risk_deferrals,
             "yield_skips": self.yield_skips,
+            "stuck_reverses": self.stuck_reverses,
             "avg_recovery_s": round(
                 sum(self.deadlock_recovery_s)
                 / max(1, len(self.deadlock_recovery_s)), 2),
@@ -232,6 +259,8 @@ class Robot:
         # out a candidate that never confirms it is backing out.
         self.yield_elect_since: dict[int, float] = {}
         self.yield_skips = 0
+        self.last_stuck_reverse = -1e9
+        self.stuck_reverses = 0
         self.backouts = 0
         self.backouts_done = 0
         self.entry_deferrals = 0
@@ -669,6 +698,47 @@ class Robot:
         # fleet stops waiting on me, rather than re-electing me every tick.
         self.yield_elect_since[self.id] = now - T_YIELD_CONFIRM - 1e-3
         return False
+
+    def check_stuck_reverse(self, now: float) -> bool:
+        """
+        Stalled with no deadlock cycle to blame -> reverse and replan anyway.
+
+        A robot only reversed as part of LIFO deadlock recovery, which needs a
+        wait-for CYCLE. Most stalls here are not cycles: 60.6% of ticks have
+        two or more robots routed to the same goal cell and 25% have three or
+        more, because there are 3 dropoffs for 4 robots and a dropoff is one
+        cell with no queue. The robots that lose that race are blocked by a
+        chain, not a cycle, so the stack never fired and they sat still.
+
+        Reversing is the right tool precisely because it needs no cooperation
+        and no free space ahead: the robot retreats over ground it has already
+        proved drivable, and the replan that follows starts from a different
+        cell with the blockage now marked, so A* can pick a different approach
+        instead of re-deriving the same blocked one.
+
+        Never while parked on a charging bay -- a robot sitting on a bay is
+        stationary because it has nothing to do, not because it is stuck, and
+        reversing off the bay would put it back in an aisle for no reason.
+        """
+        if self.backing_out or self.yielding or self.stall_since is None:
+            return False
+        if now - self.stall_since < T_STUCK_REVERSE:
+            return False
+        if now - self.last_stuck_reverse < T_REVERSE_COOLDOWN:
+            return False
+        if self.at_bay() or self.charging or self.goal is None:
+            return False
+        if not self.path or self.path_idx >= len(self.path):
+            return False
+        # Mark what is in front of me before retreating, so the replan after
+        # the reverse does not simply re-derive the route I am stuck on.
+        bx, by = self.path[self.path_idx]
+        self.table.mark_blocked(bx, by, now, OBSTACLE_CONF)
+        if not self.start_backout(now):
+            return False
+        self.last_stuck_reverse = now
+        self.stuck_reverses += 1
+        return True
 
     def dist_to_waypoint(self) -> float:
         if self.path_idx >= len(self.path):
@@ -1392,6 +1462,9 @@ class Robot:
         sgn = -1.0 if reverse else 1.0
         hx = math.cos(self.theta) * sgn
         hy = math.sin(self.theta) * sgn
+        half_w = LANE_HALF_W_REVERSE if reverse else LANE_HALF_W
+        if reverse:
+            v_out = min(v_out, V_REVERSE)
         for (px, py) in sensed:
             dx, dy = px - self.x, py - self.y
             d = math.hypot(dx, dy)
@@ -1404,7 +1477,7 @@ class Robot:
             lat = -dx * hy + dy * hx          # across my heading
             if fwd <= 0.0:
                 continue                      # behind me: not my problem
-            if abs(lat) >= LANE_HALF_W:
+            if abs(lat) >= half_w:
                 continue                      # will clear me sideways
 
             if fwd < R_HARD:
@@ -1589,6 +1662,8 @@ class Simulation:
             r.announce_waitfor(self.t)
             if r.check_deadlock(self.t):
                 self.metrics.deadlocks += 1
+            elif r.check_stuck_reverse(self.t):
+                self.metrics.stuck_reverses += 1
             r.update_battery(DT, self.t)
             # Low battery outranks everything: hand the task back and head
             # for a bay. Decided by the robot from its own SoC.
@@ -1749,6 +1824,7 @@ class Simulation:
         m.waits_executed = sum(r.waits_executed for r in rs)
         m.risk_deferrals = sum(r.risk_deferrals for r in rs)
         m.yield_skips = sum(r.yield_skips for r in rs)
+        m.stuck_reverses = sum(r.stuck_reverses for r in rs)
 
     def resolve_deadlocks(self) -> None:
         """
