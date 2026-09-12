@@ -58,10 +58,18 @@ class TestMap:
         corridor width. Per-column segmentation silently disabled the
         corridor reservation rule."""
         m = WarehouseMap()
-        a = m.aisle_at(14, 21)
+        # Moved from row 21 to row 19. Row 21 carries the P2 destination
+        # pocket, so that stretch is now 5 cells / 2.50 m wide and is
+        # correctly NOT a narrow corridor any more -- aisle_at is -1 there by
+        # design. Row 19 is the same aisle at full 3-cell width, so the
+        # property under test (flood fill spans the corridor WIDTH, not one
+        # column) is unchanged. The assertion is not relaxed.
+        a = m.aisle_at(14, 19)
         assert a != -1
-        assert m.aisle_at(15, 21) == a, "same corridor split across columns"
-        assert m.aisle_at(16, 21) == a, "same corridor split across columns"
+        assert m.aisle_at(15, 19) == a, "same corridor split across columns"
+        assert m.aisle_at(16, 19) == a, "same corridor split across columns"
+        # and the widened rows really are open, which is the point of widening
+        assert m.aisle_at(15, 21) == -1, "P2 pocket should not be a narrow aisle"
 
 
 # ==========================================================================

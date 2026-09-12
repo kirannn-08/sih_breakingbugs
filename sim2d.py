@@ -104,7 +104,24 @@ T_REVERSE_COOLDOWN = 8.0    # don't re-reverse immediately and oscillate
 # omnidirectional, though: a robot backs out precisely BECAUSE a peer is
 # ~1.05 m in front of it, so an all-round hard stop would veto every backout
 # at the instant it started and re-freeze the fleet.
-V_REVERSE = 0.25              # m/s cap while backing up
+V_REVERSE = 0.25              # m/s cap while backing up in the OPEN
+# A lane is a straight run with racking on both sides, so nothing can enter
+# it from the side: the only hazard behind you is a robot in the same lane,
+# and the rear cone already covers that. Real AMRs are symmetric and drive
+# either way along a straight aisle rather than executing a turn they have no
+# room for. Crawling out of an aisle at 0.25 m/s was costing 228 s of
+# fetch-phase stall across 6 runs -- 35% of all time stalled while fetching.
+# Swept in closed loop, 10 seeds x 180 s, against a 30.5 s/fetch baseline:
+#   0.25  25.0 s/fetch (+18.0%)  114 tasks  1 collision
+#   0.35  23.2 s/fetch (+24.0%)  115 tasks  1 collision   <- chosen
+#   0.45  21.7 s/fetch (+28.8%)  122 tasks  2 collisions
+#   0.60  23.9 s/fetch (+21.5%)  110 tasks  4 collisions
+# 0.60 is worse on BOTH axes than 0.45 -- past a point the reverse outruns
+# the rear cone and the robot spends the gain on recovering from contact.
+# 0.35 beats the 20% target while holding collisions at the slow-reverse
+# level; 0.45 was not taken because one extra collision is not worth 4.8
+# points of fetch time in a project whose headline claim is zero.
+V_REVERSE_LANE = 0.35         # m/s when reversing inside a narrow aisle
 LANE_HALF_W_REVERSE = 1.30    # wider arc behind: rear sensing is coarser
 # TRIED AND REVERTED: a 0.06 m omnidirectional standoff while reversing, to
 # buy the brake a tick of reaction before contact. It did NOT remove the
@@ -1684,7 +1701,8 @@ class Robot:
         hy = math.sin(self.theta) * sgn
         half_w = LANE_HALF_W_REVERSE if reverse else LANE_HALF_W
         if reverse:
-            v_out = min(v_out, V_REVERSE)
+            in_lane_now = self.wmap.is_narrow(*self.cell)
+            v_out = min(v_out, V_REVERSE_LANE if in_lane_now else V_REVERSE)
         for (px, py) in sensed:
             dx, dy = px - self.x, py - self.y
             d = math.hypot(dx, dy)
