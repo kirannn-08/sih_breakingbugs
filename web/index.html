@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AMR Fleet Mission Control — SIH PS 26123</title>
+  <link rel="stylesheet" href="css/styles.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%2306b6d4'><path d='M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5'/></svg>">
+</head>
+<body>
+
+  <!-- =======================================================================
+       TOP NAVIGATION BAR
+       ======================================================================= -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-icon">AMR</div>
+      <div class="brand-title">
+        <span>FLEET MISSION CONTROL</span>
+        <span class="badge-tag">SIH PS 26123</span>
+      </div>
+
+      <div class="status-pill">
+        <div id="connDot" class="status-dot"></div>
+        <span id="connLabel">CONNECTING...</span>
+      </div>
+
+      <div class="status-pill">
+        <div id="serverDot" class="status-dot"></div>
+        <span id="serverLabel">SERVER ONLINE</span>
+      </div>
+    </div>
+
+    <div class="sim-controls">
+      <div id="simClock" class="clock-display">T = 00:00.0s</div>
+
+      <div class="btn-group">
+        <button id="btnPlay" class="btn btn-success" onclick="window.app.togglePlay()">▶ Play</button>
+        <button id="btnStep" class="btn" onclick="window.app.stepSim()">⏭ Step (+0.1s)</button>
+        <button id="btnReset" class="btn btn-danger" onclick="window.app.resetSim()">↺ Reset</button>
+      </div>
+
+      <div style="display: flex; align-items: center; gap: 6px;">
+        <label for="speedSelect" style="font-size: 11px; color: var(--text-dim);">SPEED:</label>
+        <select id="speedSelect" class="speed-select" onchange="window.app.setSpeed(this.value)">
+          <option value="0.5">0.5x</option>
+          <option value="1.0" selected>1.0x (Real-time)</option>
+          <option value="2.0">2.0x</option>
+          <option value="5.0">5.0x</option>
+          <option value="10.0">10.0x</option>
+        </select>
+      </div>
+
+      <label class="toggle-label" style="font-size: 12px;">
+        <input type="checkbox" id="autoTasksCheck" checked onchange="window.app.toggleAutoTasks(this.checked)">
+        <span>Auto-Tasks</span>
+      </label>
+    </div>
+  </header>
+
+  <!-- =======================================================================
+       MAIN WORKSPACE: CANVAS VIEWPORT & SIDEBAR
+       ======================================================================= -->
+  <main class="main-container">
+
+    <!-- 2D Canvas Viewport -->
+    <div class="viewport-area">
+
+      <!-- Viewport Layer Toggles & Toolbar -->
+      <div class="canvas-toolbar">
+        <label class="toggle-label">
+          <input type="checkbox" id="chkRobots" checked> AMRs
+        </label>
+        <label class="toggle-label">
+          <input type="checkbox" id="chkLidar" checked> LiDAR & Safety
+        </label>
+        <label class="toggle-label">
+          <input type="checkbox" id="chkPaths" checked> Paths
+        </label>
+        <label class="toggle-label">
+          <input type="checkbox" id="chkReservations" checked> Reservations
+        </label>
+        <label class="toggle-label">
+          <input type="checkbox" id="chkBays" checked> Passing Bays
+        </label>
+        <label class="toggle-label">
+          <input type="checkbox" id="chkTrails" checked> Trails
+        </label>
+        <label class="toggle-label">
+          <input type="checkbox" id="chkLabels" checked> Labels
+        </label>
+
+        <div style="border-left: 1px solid var(--border-color); margin: 0 4px;"></div>
+        <button class="btn" style="padding: 2px 8px; font-size: 11px;" onclick="window.app.renderer.fitToMap()">Fit View</button>
+      </div>
+
+      <!-- Canvas -->
+      <div class="canvas-container">
+        <canvas id="simCanvas"></canvas>
+      </div>
+
+      <!-- Canvas Legend -->
+      <div class="map-legend">
+        <div class="legend-item"><div class="legend-dot" style="background: #f1f5f9; border: 1px solid #94a3b8;"></div> Shelf Rack</div>
+        <div class="legend-item"><div class="legend-dot" style="background: #e0f2fe; border: 1px dashed #0284c7;"></div> Passing Bay (Yield)</div>
+        <div class="legend-item"><div class="legend-dot" style="background: #2563eb;"></div> Pickup Station</div>
+        <div class="legend-item"><div class="legend-dot" style="background: #059669;"></div> Dropoff Station</div>
+        <div class="legend-item"><div class="legend-dot" style="background: #d97706;"></div> Charger</div>
+        <div class="legend-item"><div class="legend-dot" style="background: #dc2626;"></div> 0.5m Hard Stop</div>
+        <div class="legend-item"><div class="legend-dot" style="background: #7c3aed;"></div> Degraded (LiDAR only)</div>
+      </div>
+    </div>
+
+    <!-- Side Panel -->
+    <aside class="side-panel">
+      <!-- Tabs Navigation -->
+      <nav class="tab-nav">
+        <button class="tab-btn active" data-tab="tabFleet">Fleet Status</button>
+        <button class="tab-btn" data-tab="tabComms">Comms & Faults</button>
+        <button class="tab-btn" data-tab="tabTasks">Task Auction</button>
+        <button class="tab-btn" data-tab="tabBenchmarks">Demos & Benchmarks</button>
+      </nav>
+
+      <!-- TAB 1: FLEET STATUS & TELEMETRY -->
+      <div id="tabFleet" class="tab-content active">
+        <!-- Live KPI Badges -->
+        <div class="stats-grid" style="grid-template-columns: repeat(3, 1fr); margin-bottom: 12px;">
+          <div class="stat-box">
+            <div class="stat-title">Throughput</div>
+            <div id="kpiThroughput" class="stat-val">0.0/min</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-title">Avg Task Time</div>
+            <div id="kpiAvgTime" class="stat-val">0.0s</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-title">Collisions</div>
+            <div id="kpiCollisions" class="stat-val" style="color: var(--accent-green);">0</div>
+          </div>
+        </div>
+
+        <div class="stats-grid" style="grid-template-columns: repeat(3, 1fr); margin-bottom: 16px;">
+          <div class="stat-box">
+            <div class="stat-title">Near Misses</div>
+            <div id="kpiNearMisses" class="stat-val">0</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-title">Deadlocks Fixed</div>
+            <div id="kpiDeadlocks" class="stat-val">0</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-title">Full Stops</div>
+            <div id="kpiFullStops" class="stat-val">0</div>
+          </div>
+        </div>
+
+        <div class="section-header">
+          <span>AMR TELEMETRY STREAM</span>
+          <span style="font-size: 11px; color: var(--text-dim);">L0-L6 Onboard Layers</span>
+        </div>
+
+        <div id="robotCardsContainer">
+          <!-- Populated dynamically by app.js -->
+        </div>
+      </div>
+
+      <!-- TAB 2: COMMS MATRIX & FAULT INJECTION -->
+      <div id="tabComms" class="tab-content">
+        <div class="comms-callout">
+          <strong>★ THE ISOLATION BOUNDARY:</strong> All peer messages travel through <code>comms.py</code>. Click any link cell below to sever or restore communication live on stage.
+        </div>
+
+        <div class="section-header">
+          <span>P2P LINK STATE MATRIX</span>
+          <span style="font-size: 11px; color: var(--text-dim);">Click cell to cut/restore</span>
+        </div>
+
+        <table id="commsMatrixTable" class="matrix-table">
+          <!-- Populated dynamically by app.js -->
+        </table>
+
+        <!-- Fault Injection Buttons -->
+        <div class="section-header"><span>FAULT INJECTION SUITE</span></div>
+        <div class="comms-actions">
+          <button class="btn btn-danger" onclick="window.app.isolateRobot(1)">Isolate AMR 1 (S8)</button>
+          <button class="btn btn-danger" onclick="window.app.cutAllLinks()">Cut All Links (S5)</button>
+          <button class="btn btn-success" onclick="window.app.restoreAllLinks()">Restore All Links</button>
+          <button class="btn" style="border-color: #f59e0b; color: #f59e0b;" onclick="window.app.toggleServerOnline()">Kill / Restore Server</button>
+        </div>
+
+        <!-- Packet Loss Slider -->
+        <div class="slider-container">
+          <div class="slider-label">
+            <span>Simulated Network Packet Loss:</span>
+            <strong id="lossVal" style="color: var(--accent-cyan);">0%</strong>
+          </div>
+          <input type="range" id="lossSlider" class="slider-input" min="0" max="50" step="5" value="0"
+                 oninput="window.app.setLossRate(this.value / 100.0)">
+          <div style="display: flex; justify-content: space-between; font-size: 10px; color: var(--text-dim); margin-top: 4px;">
+            <span>0% (Ideal)</span>
+            <span>10%</span>
+            <span>20% (B4 Benchmark)</span>
+            <span>30%</span>
+            <span>50%</span>
+          </div>
+        </div>
+
+        <!-- Network Stats -->
+        <div class="section-header"><span>NETWORK METRICS</span></div>
+        <div class="stats-grid">
+          <div class="stat-box">
+            <div class="stat-title">Packets Sent</div>
+            <div id="statSent" class="stat-val">0</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-title">Delivered</div>
+            <div id="statDelivered" class="stat-val">0</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-title">Dropped</div>
+            <div id="statDropped" class="stat-val">0</div>
+          </div>
+        </div>
+        <div class="stats-grid" style="grid-template-columns: 1fr 1fr;">
+          <div class="stat-box">
+            <div class="stat-title">Traffic Volume</div>
+            <div id="statBandwidth" class="stat-val">0 KB</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-title">Packet Drop Rate</div>
+            <div id="statLoss" class="stat-val">0%</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 3: TASK AUCTION & DISPATCH -->
+      <div id="tabTasks" class="tab-content">
+        <div class="comms-callout">
+          <strong>DECENTRALIZED ALLOCATION:</strong> Tasks are broadcast to all robots. Each robot independently evaluates cost and bids; the winner claims the task without an auctioneer.
+        </div>
+
+        <div class="section-header"><span>BROADCAST NEW TASK</span></div>
+        <div class="task-form">
+          <div class="form-grid">
+            <div class="form-group">
+              <label for="taskPickupSelect">Pickup Station:</label>
+              <select id="taskPickupSelect"></select>
+            </div>
+            <div class="form-group">
+              <label for="taskDropoffSelect">Dropoff Station:</label>
+              <select id="taskDropoffSelect"></select>
+            </div>
+          </div>
+          <div class="form-grid">
+            <div class="form-group">
+              <label for="taskWeightInput">Payload Weight (kg):</label>
+              <input type="number" id="taskWeightInput" min="1" max="20" value="5.0" step="0.5">
+            </div>
+            <div class="form-group">
+              <label for="taskPrioritySelect">Priority Class:</label>
+              <select id="taskPrioritySelect">
+                <option value="1">Priority 1 (High)</option>
+                <option value="2">Priority 2 (Standard)</option>
+              </select>
+            </div>
+          </div>
+          <button class="btn btn-primary" style="width: 100%; justify-content: center;" onclick="window.app.broadcastCustomTask()">
+            📢 Broadcast Task to Fleet
+          </button>
+        </div>
+
+        <div class="section-header">
+          <span>ACTIVE TASKS IN-FLIGHT</span>
+          <span style="font-size: 11px; color: var(--text-dim);">Completed: <strong id="kpiCompletedTasks" style="color: var(--accent-green);">0</strong></span>
+        </div>
+        <div id="activeTasksList" style="margin-bottom: 16px;"></div>
+
+        <div class="section-header"><span>OPEN TASKS (AWAITING CLAIMS)</span></div>
+        <div id="openTasksList"></div>
+      </div>
+
+      <!-- TAB 4: BENCHMARKS & JUDGE SCENARIOS -->
+      <div id="tabBenchmarks" class="tab-content">
+        <div class="section-header">
+          <span>ABLATION BENCHMARK RESULTS</span>
+          <span class="badge-tag" style="background: rgba(16,185,129,0.2); color:#34d399;">+22.1% Gain</span>
+        </div>
+
+        <table class="ablation-table">
+          <thead>
+            <tr>
+              <th>Arm</th>
+              <th>Throughput</th>
+              <th>Task Time</th>
+              <th>Stops</th>
+              <th>Gain</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>B0</strong> Stop & Wait (Baseline)</td>
+              <td>1.57 /min</td>
+              <td>39.9 s</td>
+              <td>11.5</td>
+              <td>—</td>
+            </tr>
+            <tr>
+              <td><strong>B1</strong> + Congestion Cost</td>
+              <td>1.93 /min</td>
+              <td>40.9 s</td>
+              <td>12.0</td>
+              <td>-2.6%</td>
+            </tr>
+            <tr>
+              <td><strong>B2</strong> + Speed Adaptation</td>
+              <td>1.97 /min</td>
+              <td>33.1 s</td>
+              <td>4.2</td>
+              <td><strong style="color: var(--accent-green);">+17.0%</strong></td>
+            </tr>
+            <tr class="highlight">
+              <td><strong>B3</strong> Full Stack</td>
+              <td>1.67 /min</td>
+              <td>31.1 s</td>
+              <td>3.8</td>
+              <td><strong>+22.1%</strong></td>
+            </tr>
+            <tr>
+              <td><strong>B4</strong> Full @ 20% Loss</td>
+              <td>1.90 /min</td>
+              <td>33.4 s</td>
+              <td>3.0</td>
+              <td><strong style="color: var(--accent-blue);">+16.2%</strong></td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="section-header"><span>JUDGE DEMO SCENARIOS</span></div>
+
+        <div class="scenario-card">
+          <div class="scenario-header">
+            <span class="scenario-title">1. Decentralized Allocation</span>
+            <button class="btn btn-primary" style="padding: 3px 10px; font-size: 11px;" onclick="window.app.runScenario(1)">Run S1</button>
+          </div>
+          <div class="scenario-takeaway">"No auctioneer — every robot computes the exact same winner."</div>
+        </div>
+
+        <div class="scenario-card">
+          <div class="scenario-header">
+            <span class="scenario-title">2. Speed Adaptation</span>
+            <button class="btn btn-primary" style="padding: 3px 10px; font-size: 11px;" onclick="window.app.runScenario(2)">Run S2</button>
+          </div>
+          <div class="scenario-takeaway">"Shared aisle: conflict resolved by slowing, not halting (+17.0% gain)."</div>
+        </div>
+
+        <div class="scenario-card">
+          <div class="scenario-header">
+            <span class="scenario-title">3. Deadlock Cycle Recovery</span>
+            <button class="btn btn-primary" style="padding: 3px 10px; font-size: 11px;" onclick="window.app.runScenario(3)">Run S3</button>
+          </div>
+          <div class="scenario-takeaway">"Wait-for graph cycle detection; lowest priority yields into passing bay."</div>
+        </div>
+
+        <div class="scenario-card">
+          <div class="scenario-header">
+            <span class="scenario-title">4. Server Death Resilience</span>
+            <button class="btn btn-primary" style="padding: 3px 10px; font-size: 11px;" onclick="window.app.runScenario(4)">Run S4</button>
+          </div>
+          <div class="scenario-takeaway">"Central server killed mid-run: fleet keeps completing tasks autonomously."</div>
+        </div>
+
+        <div class="scenario-card">
+          <div class="scenario-header">
+            <span class="scenario-title">5. Total Comms Blackout</span>
+            <button class="btn btn-primary" style="padding: 3px 10px; font-size: 11px;" onclick="window.app.runScenario(5)">Run S5</button>
+          </div>
+          <div class="scenario-takeaway">"THE differentiator: fleet enters degraded mode with 0 collisions on LiDAR."</div>
+        </div>
+
+        <div class="scenario-card">
+          <div class="scenario-header">
+            <span class="scenario-title">6. 20% Packet Loss Stress</span>
+            <button class="btn btn-primary" style="padding: 3px 10px; font-size: 11px;" onclick="window.app.runScenario(6)">Run S6</button>
+          </div>
+          <div class="scenario-takeaway">"Staleness decay in cost function; robust decentralized throughput."</div>
+        </div>
+
+        <div class="scenario-card">
+          <div class="scenario-header">
+            <span class="scenario-title">7. Edge-AI Learned Policy</span>
+            <button class="btn btn-primary" style="padding: 3px 10px; font-size: 11px;" onclick="window.app.runScenario(7)">Run S7</button>
+          </div>
+          <div class="scenario-takeaway">"8.9k-param neural net, 7x7 local window, sub-millisecond inference on CPU."</div>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <!-- =======================================================================
+       BOTTOM COLLAPSIBLE EVENT & DIAGNOSTICS DRAWER
+       ======================================================================= -->
+  <footer class="bottom-drawer">
+    <div class="drawer-header">
+      <div style="display: flex; align-items: center; gap: 10px;">
+        <span style="font-weight: 700; color: var(--text-main);">COORDINATION EVENT LOG</span>
+        <div class="filter-pills">
+          <button class="filter-pill active" data-filter="ALL">ALL</button>
+          <button class="filter-pill" data-filter="AUCTION">AUCTION</button>
+          <button class="filter-pill" data-filter="SPEED">SPEED</button>
+          <button class="filter-pill" data-filter="DEADLOCK">DEADLOCK</button>
+          <button class="filter-pill" data-filter="COMMS">COMMS</button>
+          <button class="filter-pill" data-filter="SAFETY">SAFETY</button>
+          <button class="filter-pill" data-filter="TASK">TASK</button>
+        </div>
+      </div>
+      <button class="btn" style="padding: 2px 8px; font-size: 10px;" onclick="document.getElementById('logStream').innerHTML = ''">Clear Log</button>
+    </div>
+
+    <div id="logStream" class="log-stream">
+      <div class="log-row">
+        <span class="log-time">[T=0.0s]</span>
+        <span class="log-cat cat-SYSTEM">SYSTEM</span>
+        <span class="log-msg">Mission Control Console ready. Awaiting telemetry...</span>
+      </div>
+    </div>
+  </footer>
+
+  <!-- Scripts -->
+  <script src="js/renderer.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
+

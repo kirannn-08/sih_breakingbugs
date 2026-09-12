@@ -94,7 +94,9 @@ amr_fleet/
 ├── train_policy.py       imitation training (~4 s end to end)
 ├── run_benchmark.py      5-arm benchmark harness
 ├── demo_scenarios.py     7 runnable demo scenarios
-├── tests/test_all.py     51 tests
+├── dashboard_server.py   live WebSocket & REST mission control server
+├── web/                  web frontend (HTML5/Canvas/CSS/JS mission control)
+├── tests/test_all.py     51 tests (+ test_dashboard.py)
 ├── docs/ENGINEERING_LOG.md   every bug we hit, with evidence
 └── results/              captured test + benchmark output
 ```
@@ -106,15 +108,16 @@ amr_fleet/
 ```bash
 pip install -r requirements.txt
 
+python3 dashboard_server.py     # launch live web frontend (http://localhost:8080)
 python3 warehouse_map.py        # render the map
 python3 sim2d.py                # single run
 python3 train_policy.py         # train the policy (~4 s)
 python3 run_benchmark.py 10     # reproduce +22.1%
 python3 demo_scenarios.py       # all 7 demo scenarios
-python3 -m pytest tests/ -v     # 51 tests
+python3 -m pytest tests/ -v     # 57 tests
 ```
 
-Only runtime dependency is **numpy**.
+Only runtime dependency is **numpy** (and **tornado** for the web dashboard).
 
 ---
 
