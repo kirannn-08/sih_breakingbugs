@@ -89,6 +89,23 @@ LIFO_EPS = 0.25      # entry stamps within this are a tie -> distance decides
 # WaitFor.backing_out is broadcast.
 T_YIELD_CONFIRM = 3.0
 
+# Negotiated push-back.
+#
+# When robot A is halted because robot B is in its lane, A asks B to move
+# and BOTH evaluate the same rule, so the answer is agreed rather than
+# guessed. Before this, each robot decided to reverse on its own evidence,
+# which is symmetric: either both reversed, or the one that reversed drove
+# straight back into the same blockage. Measured: robots ping-ponging between
+# two cells for 773-1281 ticks per 4000-tick run, 20-32% of the time.
+#
+# Order: PRIORITY first, then DISTANCE COVERED on the current leg. The robot
+# that has driven further keeps going and the one that has driven less
+# reverses, because progress is sunk cost -- making the nearly-finished robot
+# give way throws away the most work and it will only have to redo it. It is
+# also the same principle as the LIFO stack expressed in metres instead of
+# seconds: whoever has least invested in this corridor is cheapest to move.
+PROGRESS_EPS = 0.5   # metres; closer than this is a tie, decide by id
+
 # predictive segment reservation
 SEG_HORIZON = 14.0   # s of announced path scanned for segment traversals
 
@@ -482,3 +499,30 @@ def predicted_head_on(mine: list[tuple[int, float, float, int, int]],
                 if best is None or t0 < best[2]:
                     best = (seg, pid, t0)
     return best
+
+
+# --------------------------------------------------------------------------
+# 6. Negotiated push-back  --  "you are in my way, one of us must reverse"
+# --------------------------------------------------------------------------
+
+def resolve_pushback(my_prio: list[float], my_progress: float,
+                     their_prio: list[float], their_progress: float,
+                     my_id: int, their_id: int) -> bool:
+    """
+    True if I am the one who must reverse.
+
+    Evaluated identically by both robots from the same broadcast numbers, so
+    they cannot both reverse (which wastes two manoeuvres and re-blocks the
+    corridor) and cannot both proceed (which is a collision the brake then has
+    to catch). Deterministic and total: priority, then progress, then id.
+
+    `my_prio` is a priority TUPLE where lower means more urgent, so a larger
+    tuple yields. Progress is metres driven on the current leg; more progress
+    wins. The id tie-break only ever runs when two robots have identical
+    priority and are within PROGRESS_EPS, and it is stable.
+    """
+    if tuple(my_prio) != tuple(their_prio):
+        return tuple(my_prio) > tuple(their_prio)
+    if abs(my_progress - their_progress) > PROGRESS_EPS:
+        return my_progress < their_progress
+    return my_id > their_id

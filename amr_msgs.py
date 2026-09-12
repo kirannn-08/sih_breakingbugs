@@ -31,7 +31,7 @@ from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Any
 
-SCHEMA_VERSION = "1.1.0"
+SCHEMA_VERSION = "1.2.0"
 
 BROADCAST = 0  # robot_id 0 means "to everyone" / "no robot"
 
@@ -63,6 +63,7 @@ class MsgType(str, Enum):
     REROUTE = "REROUTE"
     COORDINATION = "COORDINATION"
     WAIT_FOR = "WAIT_FOR"
+    BAY_CLAIM = "BAY_CLAIM"          # added 1.2.0, additive
     TELEMETRY = "TELEMETRY"
 
 
@@ -250,6 +251,36 @@ class Coordination:
     resolution: str = Resolution.I_SLOW.value
     my_new_speed: float = 0.0
     my_priority: list[float] = field(default_factory=list)
+    # -- ADDED 1.2.0, additive only (all defaulted).
+    # `progress_m` is how far I have driven on the CURRENT leg. A peer cannot
+    # derive it: RobotState carries position, not distance travelled, and two
+    # robots one metre apart may have driven 0.5 m and 30 m to get there. It
+    # is the tie-break that decides who reverses, so it has to be on the wire.
+    progress_m: float = 0.0
+    request: bool = False            # True = "please move", False = verdict
+
+
+@dataclass
+class BayClaim:
+    """
+    I intend to occupy this charging bay.  Added in schema 1.2.0.
+
+    Bay choice used to be inferred: a peer was assumed to want a bay if it was
+    standing on it, or if the last cell of its broadcast Intent path was one.
+    That only tells you where a robot IS or where its CURRENT path ends, so
+    two robots could pick the same bay from opposite sides of the map and
+    neither would discover it until one arrived. An explicit claim lets peers
+    divert WHILE STILL IN TRANSIT, which is the only time diverting is cheap.
+
+    `claimed_at` is the sender's clock, and the EARLIER claim wins. That makes
+    the resolution independent of who heard whom first.
+    """
+    header: Header
+    bay_cx: int
+    bay_cy: int
+    claimed_at: float = 0.0
+    eta: float = 0.0
+    releasing: bool = False          # leaving the bay; claim is void
 
 
 @dataclass
@@ -385,7 +416,7 @@ def is_higher_priority(a: list[float], b: list[float]) -> bool:
 
 
 __all__ = [
-    "SCHEMA_VERSION", "BROADCAST", "INF_COST",
+    "SCHEMA_VERSION", "BROADCAST", "INF_COST", "BayClaim",
     "RobotMode", "MsgType", "ReleaseReason", "RerouteReason",
     "Resolution", "ObstacleKind",
     "Header", "RobotState", "Reservation", "Intent", "Task", "Bid",
