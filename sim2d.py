@@ -301,7 +301,7 @@ class Robot:
         self.pushbacks_sent = 0
         self.pushbacks_yielded = 0
         # -- BAY RESERVATION
-        self.bay_claims: dict[tuple[int, int], tuple[int, float, float]] = {}
+        self.bay_claims: dict[tuple[int, int], tuple[int, float, float, float]] = {}
         self.my_bay_claim: tuple[int, int] | None = None
         self.last_bay_bc = -1e9
         self.bay_claim_stamp = 0.0
@@ -402,9 +402,10 @@ class Robot:
                     if self.bay_claims.get(bay, (0,))[0] == pkt.src:
                         self.bay_claims.pop(bay, None)
                 else:
-                    self.bay_claims[bay] = (pkt.src,
-                                            float(p.get("claimed_at", now)),
-                                            float(p.get("eta", 0.0)))
+                    self.update_bay_claim(bay, pkt.src,
+                                          float(p.get("claimed_at", now)),
+                                          float(p.get("eta", 0.0)),
+                                          now)
             elif t == MsgType.WAIT_FOR.value:
                 p = pkt.payload
                 self.deadlock.set_edge(pkt.src, int(p.get("waiting_for", 0)))
@@ -1038,7 +1039,7 @@ class Robot:
         for pid, st in self.peers.items():
             if now - self.peer_seen_at.get(pid, -1e9) > 2.0:
                 continue
-            if math.hypot(st.x - bx, st.y - by) < 1.2:
+            if math.hypot(st.x - bx, st.y - by) < 0.4:
                 return True
         for pid, it in self.peer_intents.items():
             if now - self.peer_seen_at.get(pid, -1e9) > 2.0:
@@ -1054,7 +1055,7 @@ class Robot:
         # The EARLIER claim wins, so the outcome does not depend on who heard
         # whom first.
         owner = self.bay_claims.get(bay)
-        if owner is not None and now - self.peer_seen_at.get(owner[0], -1e9) <= 5.0:
+        if owner is not None and now - owner[3] <= 5.0:
             mine = self.bay_claim_stamp if self.my_bay_claim == bay else None
             if mine is None or owner[1] < mine - 1e-9:
                 return True
@@ -1071,6 +1072,9 @@ class Robot:
             if not self.bay_taken(b, now):
                 return b
         return bays[0] if bays else None
+
+    def update_bay_claim(self, bay: tuple[int, int], src: int, claimed_at: float, eta: float, now: float) -> None:
+        self.bay_claims[bay] = (src, claimed_at, eta, now)
 
     def claim_bay(self, bay: tuple[int, int], now: float) -> None:
         """Announce that this bay is mine, with the time I decided it."""
@@ -1875,7 +1879,7 @@ class Simulation:
                         if not self._near.get(key):
                             self.metrics.near_misses += 1
                         self._near[key] = True
-                    else:
+                    elif d > 2.0:
                         self._near[key] = False
 
     def step(self) -> None:
