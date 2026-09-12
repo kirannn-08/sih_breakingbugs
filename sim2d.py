@@ -30,7 +30,7 @@ from coordination import (CHARGE_RATE, OBSTACLE_CONF, SOC_LOW, SOC_RESUME,
                           make_priority, predicted_head_on, resolve_auction,
                           sample_trajectory, segment_windows)
 from planner import (ReservationTable, congestion_cost, path_length_m, plan,
-                     path_to_reservations)
+                     path_to_reservations, plan_st, schedule_of)
 from warehouse_map import CELL_SIZE, WarehouseMap
 
 DT = 0.1
@@ -104,6 +104,10 @@ class Metrics:
     backouts: int = 0
     backouts_done: int = 0
     entry_deferrals: int = 0
+    planned_waits: int = 0
+    waits_executed: int = 0
+    collision_ticks: int = 0
+    near_miss_ticks: int = 0
 
     def summary(self) -> dict:
         n = max(1, len(self.task_times))
@@ -114,7 +118,9 @@ class Metrics:
             "throughput_per_min": round(60.0 * self.tasks_completed
                                         / max(1e-6, self.sim_time), 2),
             "collisions": self.collisions,
+            "collision_ticks": self.collision_ticks,
             "near_misses": self.near_misses,
+            "near_miss_ticks": self.near_miss_ticks,
             "deadlocks": self.deadlocks,
             "full_stops": self.full_stops,
             "time_stopped": round(self.time_stopped, 2),
@@ -128,6 +134,8 @@ class Metrics:
             "backouts": self.backouts,
             "backouts_done": self.backouts_done,
             "entry_deferrals": self.entry_deferrals,
+            "planned_waits": self.planned_waits,
+            "waits_executed": self.waits_executed,
             "avg_recovery_s": round(
                 sum(self.deadlock_recovery_s)
                 / max(1, len(self.deadlock_recovery_s)), 2),
@@ -215,6 +223,9 @@ class Robot:
         self.backouts = 0
         self.backouts_done = 0
         self.entry_deferrals = 0
+        self.path_holds: list[float] = []
+        self.planned_waits = 0        # holds the planner asked for
+        self.waits_executed = 0       # ticks actually spent honouring one
 
     # -- geometry ----------------------------------------------------------
 
@@ -590,6 +601,12 @@ class Robot:
 
         return self.start_backout(now)
 
+    def dist_to_waypoint(self) -> float:
+        if self.path_idx >= len(self.path):
+            return 0.0
+        wx, wy = self.wmap.to_world(*self.path[self.path_idx])
+        return max(0.05, math.hypot(wx - self.x, wy - self.y))
+
     def dist_to_blocker(self, now: float) -> float:
         """Metres to the peer I believe blocks me. Broadcast, and a LIFO tiebreak."""
         st = self.peers.get(self.waitfor_target)
@@ -803,16 +820,44 @@ class Robot:
         self.replan(now)
 
     def replan(self, now: float) -> bool:
+        """
+        Replan, keeping the SCHEDULE as well as the route.
+
+        `plan` alone throws away the timing, and the timing is the entire
+        point of a space-time search: a plan that says "hold at this cell for
+        3 s and then go straight through" is indistinguishable, once
+        collapsed to cells, from one that says "go straight through now".
+        Executing it as the latter is how the planner's waits became
+        invisible detour-or-nothing decisions.
+        """
         if self.goal is None:
             return False
         cx, cy = self.cell
-        p = plan(self.wmap, (cx, cy), self.goal, self.table, self.id,
-                 now, now, self.v_nom, V_MAX, self.flags["congestion"])
-        if p:
-            self.path, self.path_idx = p, 0
-            self.replans += 1
-            return True
-        return False
+        st = plan_st(self.wmap, (cx, cy), self.goal, self.table, self.id,
+                     now, now, self.v_nom, V_MAX, self.flags["congestion"])
+        if not st:
+            return False
+        depart = schedule_of(st)
+        path: list[tuple[int, int]] = []
+        for (px, py, _t) in st:
+            if not path or path[-1] != (px, py):
+                path.append((px, py))
+        # A hold is only recorded where the plan genuinely waits -- where the
+        # scheduled departure is later than free-running arrival. Enforcing
+        # the whole schedule would pin every robot to v_nom for its entire
+        # route and quietly delete speed adaptation.
+        holds = [0.0] * len(path)
+        t = now
+        step = CELL_SIZE / max(0.05, self.v_nom)
+        for i in range(len(path)):
+            if depart[i] > t + 1e-6:
+                holds[i] = depart[i]
+                self.planned_waits += 1
+            t = max(depart[i], t) + step
+        self.path, self.path_idx = path, 0
+        self.path_holds = holds
+        self.replans += 1
+        return True
 
     # -- motion ------------------------------------------------------------
 
@@ -1104,6 +1149,21 @@ class Robot:
         if reactive or predictive:
             return 0.0
 
+        # Execute a PLANNED wait as a slowdown, not as a halt. The planner
+        # decided this cell should be left at a particular time; the speed to
+        # achieve that is a computed quantity, and it falls to zero only when
+        # it drops below v_min -- the same rule as every other stop here.
+        sched_cap = V_MAX
+        if 0 < self.path_idx <= len(self.path_holds):
+            hold = self.path_holds[self.path_idx - 1]
+            if hold > now:
+                self.waits_executed += 1
+                d = self.dist_to_waypoint()
+                v_req, act = adapt_speed(d, hold, now, self.v, V_MIN, V_MAX)
+                sched_cap = v_req
+                if act == "STOP" and self.v > 0.01:
+                    self.stops += 1
+
         # Drive within sight distance. Geometry, not comms -- it holds in a
         # blackout, and it applies to BOTH arms because it is a sensing limit
         # rather than the conflict-resolution mechanism under test.
@@ -1115,7 +1175,7 @@ class Robot:
         # LOCAL SENSING ARM. Runs first and unconditionally: it must still
         # produce a decision when every packet is being dropped, which is the
         # whole reason it exists. It can only lower the final command.
-        lidar_cap = min(self.lidar_speed_cap(now), blind_cap)
+        lidar_cap = min(self.lidar_speed_cap(now), blind_cap, sched_cap)
 
         if not self.flags["speed_adapt"]:
             return min(self._stop_and_wait_speed(now), lidar_cap)
@@ -1330,6 +1390,9 @@ class Simulation:
         self.next_task_id = 1
         self.open_tasks: dict[int, Task] = {}
         self.task_announced_at: dict[int, float] = {}
+        # contact latches, so a sustained graze counts once (see BUG 7)
+        self._contact: dict[tuple[int, int], bool] = {}
+        self._near: dict[tuple[int, int], bool] = {}
 
     def announce_task(self) -> None:
         nodes = self.wmap.nodes
@@ -1348,13 +1411,38 @@ class Simulation:
                 wrap(t, MsgType.TASK, 0, r.id, self.t))
 
     def check_collisions(self) -> None:
+        """
+        Count contact EVENTS, not ticks.
+
+        ENGINEERING_LOG BUG 7 fixed exactly this defect in the stop metric and
+        left it in place here. One sustained graze between a moving robot and
+        a parked one reported 1359 "collisions" on seed 5 -- it was a single
+        contact lasting 136 s. Tick counting makes a long mild contact look
+        catastrophic and two brief hard ones look benign, so it cannot be
+        compared across runs at all.
+
+        `collision_ticks` is kept alongside because DURATION of contact is
+        real information; it is just not a count of collisions.
+        """
         for i, a in enumerate(self.robots):
             for b in self.robots[i + 1:]:
+                key = (a.id, b.id)
                 d = math.hypot(a.x - b.x, a.y - b.y)
                 if d < D_COLLIDE:
-                    self.metrics.collisions += 1
-                elif d < D_NEAR:
-                    self.metrics.near_misses += 1
+                    self.metrics.collision_ticks += 1
+                    if not self._contact.get(key):
+                        self.metrics.collisions += 1     # transition INTO contact
+                    self._contact[key] = True
+                else:
+                    if self._contact.get(key):
+                        self._contact[key] = False
+                    if d < D_NEAR:
+                        self.metrics.near_miss_ticks += 1
+                        if not self._near.get(key):
+                            self.metrics.near_misses += 1
+                        self._near[key] = True
+                    else:
+                        self._near[key] = False
 
     def step(self) -> None:
         self.t += DT
@@ -1416,9 +1504,21 @@ class Simulation:
             for o in self.robots:
                 if o.id == r.id:
                     continue
-                if math.hypot(o.x - r.x, o.y - r.y) >= LIDAR_RANGE:
+                d = math.hypot(o.x - r.x, o.y - r.y)
+                if d >= LIDAR_RANGE:
                     continue
-                if not self.wmap.line_of_sight(r.x, r.y, o.x, o.y):
+                # Occlusion is a LONG-RANGE optical property. At contact range
+                # it is not physical: a rack corner cannot hide a 0.98 m wide
+                # body whose centre is 0.97 m from yours -- the two footprints
+                # are already overlapping, and a real AMR's bumper and
+                # proximity ring do not care what the scanner can see.
+                #
+                # Without this exemption two robots could sit diagonally
+                # across a rack corner, mutually invisible, and graze at
+                # 0.974 m with the supervisor never firing. Measured on
+                # seed 5: 1359 contact ticks from exactly that geometry.
+                if d >= D_NEAR and not self.wmap.line_of_sight(
+                        r.x, r.y, o.x, o.y):
                     self.metrics.lidar_occluded += 1
                     continue
                 sensed.append((o.x, o.y))
@@ -1558,6 +1658,9 @@ class Simulation:
         self.metrics.backouts_done = sum(r.backouts_done for r in self.robots)
         self.metrics.entry_deferrals = sum(r.entry_deferrals
                                            for r in self.robots)
+        self.metrics.planned_waits = sum(r.planned_waits for r in self.robots)
+        self.metrics.waits_executed = sum(r.waits_executed
+                                          for r in self.robots)
         out = self.metrics.summary()
         out["comms"] = self.comms.stats()
         return out
