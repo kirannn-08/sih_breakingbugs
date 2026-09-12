@@ -18,45 +18,74 @@ A server broadcasts tasks and collects telemetry — it never commands.
 
 ## Current state
 
-- **56/57 tests passing. `test_T18_beats_stop_and_wait` FAILS at 19.6%** (target
-  20%). Not weakened — the fix or the expectation is wrong, not the test.
-- **The robot now has a real footprint.** `sim2d.py` previously had none: the
-  collision test was a bare `d < 0.44`, less than half the 0.98 m body width,
-  so two AMRs at 0.5 m centre-to-centre counted as "no collision" while
-  interpenetrating. `ROBOT_LEN/WIDTH/RADIUS` and `D_COLLIDE = 0.98` are now
-  derived constants. **Every previous "zero collision" result was measured
-  against a robot less than half the real size.**
-- The safety supervisor is **directional** (in-lane ahead + omnidirectional
-  contact floor). An isotropic ring at 1.10 m forbade two robots ever passing
-  side by side and pinned them at 1.11 m crawling at 0.007 m/s.
-- Default map: **+19.3%** vs stop-and-wait, **0 collisions** (genuinely, at 0.98 m), 10 seeds — BELOW the 20% target
-- **Task time is measured from `announced_at`, not from the last accept.** Tasks
-  can now be released and re-auctioned; timing from the final accept would
-  silently discard every failed attempt. This folds allocation latency in, so
-  absolute times rose (B0 42.8 → 47.9 s) while the ratio held.
-- B4 @ 20% loss: **+26.2%** vs B3's +23.1% — a 0.49 sigma difference, i.e.
-  **statistically indistinguishable**, not "loss helps". Do not quote B4 as better.
-- **Congestion-aware routing alone (B1) is worth nothing**: +0.18 s vs B0, inside
-  noise. Speed adaptation carries the result (B2 alone = +21.0%). Likely a
-  symptom of flaw 2 — a time-dependent cost driven by a search with no time in
-  its state produces detours without benefit.
+Numbers below are 4 robots, 180 s, 20 seeds, **with occluded sensing**. Every
+earlier figure in this file was measured with a sensor that saw through solid
+racking; they are not comparable and have been replaced.
+See `docs/DEADLOCK_RESOLUTION.md` for the full write-up.
+
+- **56/57 tests passing. `test_T18_beats_stop_and_wait` FAILS at +15.9%**
+  (target 20%). Left failing deliberately — the case that it measures the
+  wrong quantity is in DEADLOCK_RESOLUTION.md §7.1, not in a weakened assert.
+- **Two headline metrics, and they disagree.** `avg_task_time` averages over
+  *completed* tasks only, so finishing the hard tasks the baseline abandons
+  drags the mean up. Seed 3: baseline 1 task, full system 5. **Throughput is
+  the unbiased one: 4.7 → 6.0 tasks/run, +30.1%, paired t = 2.55.** Quote
+  throughput; quote task time only alongside it.
+- Default map, B3 full: **+15.9%** task time, **+30.1%** throughput,
+  **0 collisions** across all 140 runs of all 7 arms.
+- **LiDAR is occluded** (`WarehouseMap.line_of_sight`, Amanatides-Woo) and now
+  drives *decisions*, not just the brake: `perception.LidarTracker`,
+  `lidar_scan` (comms-free obstacle marking), `lidar_speed_cap`, and a
+  blind-corner rule at aisle mouths. Turning occlusion on alone produced 182
+  collisions on seed 1 — the brake had been relying on omniscience.
+- **Deadlock resolution is LIFO**, not priority: the last robot into the
+  contested region backs out along its own trail, and the stack includes
+  everyone *queued behind* the cycle, not just cycle members. Recovery went
+  from *never* (a 2-cycle held 4589 robot-ticks on seed 3) to 1.4–20 s.
+  84 backouts started / 82 completed over 20 seeds.
+- **Space-time A\* is fixed** (flaw 2): state is `(x, y, t_bucket)` with a
+  WAIT action; `plan` keeps its adjacency contract, `plan_st`/`schedule_of`
+  carry the timing, and a planned wait executes as a computed slowdown.
+  Confirmed live: 215 WAIT actions across 147 plans. Latency 16.2 ms.
+- **B1 (congestion routing alone) is still worth nothing: −0.7%, t = 0.12** —
+  even after the space-time fix. The earlier diagnosis that flaw 2 explained
+  it was incomplete.
+- **The LIFO stack's throughput gain is not statistically established**
+  (+0.60 tasks, t = 1.75, n = 20). It demonstrably resolves jams that never
+  resolved before; that it raises throughput is suggested, not proven.
+- **Learned deadlock-risk model**: trained on THIS map from 58,763 synthetic
+  samples, 6,178 params, 0.007 ms. Held-out **AUC 0.839 on moving robots** —
+  *not* the 0.975 all-slice figure, which is inflated (`stall_age` alone
+  scores 0.930 on it). **In the loop it does not beat the deterministic rule**
+  (t = 1.45), so it ships **off by default**. Do not quote it as a win.
+- **The MARL policy loses to a classical planner** on our own map: 87.1%
+  held-out action agreement, but 3–33% of WHCA\* throughput, beaten by
+  greedy+jitter at every N ≥ 16. Compounding covariate shift. EPH is cited
+  prior art, **not implemented**.
+- `use_policy` is **still dead** (DEAD_CODE.md Tier 3). `use_risk_model` is
+  the one that is consumed.
+- **amr_msgs is 1.1.0.** `WaitFor` gained `entered_at`, `segment_id`,
+  `dist_to_block`, `backing_out` — additive only, all defaulted, 1.0.0
+  receivers unaffected. Flagged per the frozen-contract rule.
+- Collisions/near-misses now count **events, not ticks** (BUG 7's defect,
+  left in this metric). One 136 s graze had reported as 1359 collisions.
 - Dashboard: `python3 dashboard_server.py --port 8080` (needs tornado)
-- SIH layout: **`run_sih_layout.py` is broken** — it calls
-  `Simulation(wmap=..., starts=...)` and `Simulation.__init__` accepts neither,
-  so it raises `TypeError` before running. Pre-existing, predates the auction
-  fix. **The +20.0% SIH figure is therefore unreproducible — do not quote it**
-  until the script is repaired.
-- Learned policy: 8,901 params, 91.8% held-out, 0.025 ms inference
+- SIH layout: **`run_sih_layout.py` is still broken** — `Simulation(wmap=...,
+  starts=...)` matches no signature. **The +20.0% SIH figure remains
+  unreproducible — do not quote it.**
 - Only runtime dependency is numpy
 
 ## Commands
 
 ```bash
-python3 -m pytest tests/ -q      # 57 tests, ~10 s
+python3 -m pytest tests/ -q      # 57 tests, ~35 s
 python3 run_benchmark.py 10      # headline number
 python3 run_sih_layout.py        # the SIH drawing's layout
 python3 demo_scenarios.py        # 7 demo scenarios
-python3 train_policy.py          # retrain policy (~4 s)
+python3 train_policy.py          # retrain action policy (~4 s)
+python3 synth_data.py            # regenerate synthetic deadlock data (~5 min)
+python3 train_deadlock.py        # train the deadlock-risk model (~1 s)
+cd rl && python3 train.py && python3 run_study.py   # MAPF scaling on our map
 ```
 
 ---
@@ -84,7 +113,7 @@ Verified live, not a no-op: 1632 `BID` + 13 `CLAIM` per 180 s run, and
 triggers only where it should. B4 went **+24.8% → +16.2%**, exactly the
 predicted direction.
 
-### 2. Space-time A\* has no time in its state
+### 2. Space-time A\* has no time in its state — ✅ FIXED
 
 `planner.py :: plan` — the closed set is `set[tuple[int, int]]`. Spatial only.
 
@@ -111,7 +140,7 @@ real hardware.
 **Fix:** add `max_omega`, rotate toward the heading at a bounded rate, and
 penalize turns in the planner cost so ETA and reality agree.
 
-### 4. Omniscient LiDAR (sees through racks)
+### 4. Omniscient LiDAR (sees through racks) — ✅ FIXED
 
 `sim2d.py :: Simulation.step` builds `sensed` from pure Euclidean distance
 with no occlusion check. Robots detect peers through solid racks and around
