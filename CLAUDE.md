@@ -18,8 +18,18 @@ A server broadcasts tasks and collects telemetry — it never commands.
 
 ## Current state
 
-- 57 tests passing (`python3 -m pytest tests/ -q`) — includes the dashboard suite
-- Default map: **+23.1%** task-time reduction vs stop-and-wait, **0 collisions**, 10 seeds
+- **56/57 tests passing. `test_T18_beats_stop_and_wait` FAILS at 19.6%** (target
+  20%). Not weakened — the fix or the expectation is wrong, not the test.
+- **The robot now has a real footprint.** `sim2d.py` previously had none: the
+  collision test was a bare `d < 0.44`, less than half the 0.98 m body width,
+  so two AMRs at 0.5 m centre-to-centre counted as "no collision" while
+  interpenetrating. `ROBOT_LEN/WIDTH/RADIUS` and `D_COLLIDE = 0.98` are now
+  derived constants. **Every previous "zero collision" result was measured
+  against a robot less than half the real size.**
+- The safety supervisor is **directional** (in-lane ahead + omnidirectional
+  contact floor). An isotropic ring at 1.10 m forbade two robots ever passing
+  side by side and pinned them at 1.11 m crawling at 0.007 m/s.
+- Default map: **+19.3%** vs stop-and-wait, **0 collisions** (genuinely, at 0.98 m), 10 seeds — BELOW the 20% target
 - **Task time is measured from `announced_at`, not from the last accept.** Tasks
   can now be released and re-auctioned; timing from the final accept would
   silently discard every failed attempt. This folds allocation latency in, so

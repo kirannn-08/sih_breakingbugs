@@ -32,6 +32,18 @@ T_REBID = 0.5      # retry cadence for a task nobody could take yet
 T_RELEASE = 8.0    # stalled this long while fetching -> give the task back
 T_COOLDOWN = 12.0  # ...and don't re-bid on it for this long
 
+# battery policy. A robot does NOT visit a charger because it is idle --
+# only because it is actually low. Idling ON a bay is different from
+# charging: it parks there to clear the aisles, and tops up while it waits.
+SOC_LOW = 0.25       # below this, charging outranks any task
+SOC_RESUME = 0.90    # charge to here before bidding again
+CHARGE_RATE = 0.02   # SoC per second on a bay
+
+# A stalled robot IS an obstacle. Announce it, let peers route around it.
+T_OBSTACLE = 3.0     # stalled this long -> broadcast myself as blocking
+T_WAITFOR = 1.0      # cadence for wait-for edge broadcasts
+OBSTACLE_CONF = 1.0  # initial belief; decays 0.05/s in ReservationTable
+
 # conflict prediction (doc E.4)
 HORIZON = 10.0
 DT_SAMPLE = 0.5

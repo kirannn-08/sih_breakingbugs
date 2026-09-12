@@ -18,11 +18,13 @@ import random
 from dataclasses import dataclass, field
 
 from amr_msgs import (BROADCAST, INF_COST, Bid, Claim, Header, Intent, MsgType,
-                      Release, ReleaseReason, RobotMode, RobotState, Task,
-                      make_header, wrap)
+                      Obstacle, ObstacleKind, Release, ReleaseReason, RobotMode,
+                      RobotState, Task, WaitFor, make_header, wrap)
 from comms import CommsMediator
-from coordination import (T_BID, T_CLAIM, T_COOLDOWN, T_REBID, T_RELEASE,
-                          V_MIN, DeadlockDetector, adapt_speed, bid_cost,
+from coordination import (CHARGE_RATE, OBSTACLE_CONF, SOC_LOW, SOC_RESUME,
+                          T_BID, T_CLAIM, T_COOLDOWN, T_OBSTACLE, T_REBID,
+                          T_RELEASE, T_WAITFOR, V_MIN,
+                          DeadlockDetector, adapt_speed, bid_cost,
                           conflict_risk, feasible, first_conflict, has_quorum,
                           make_priority, resolve_auction, sample_trajectory)
 from planner import (ReservationTable, congestion_cost, path_length_m, plan,
@@ -32,6 +34,34 @@ from warehouse_map import CELL_SIZE, WarehouseMap
 DT = 0.1
 V_MAX = 0.8
 E_FULL = 100.0
+
+# -- PHYSICAL FOOTPRINT -----------------------------------------------------
+# There was previously no footprint in this file at all: collisions were
+# tested with a bare `d < 0.44`, which is less than half the real robot's
+# width. Two AMRs at 0.5 m centre-to-centre were counted as "no collision"
+# while physically interpenetrating, which is why the fleet reported zero
+# collisions while visibly overlapping on the dashboard.
+ROBOT_LEN = 1.00                                   # m, along heading
+ROBOT_WIDTH = 0.98                                 # m, wheels included
+ROBOT_RADIUS = math.hypot(ROBOT_LEN / 2, ROBOT_WIDTH / 2)   # 0.70 m
+
+D_COLLIDE = ROBOT_WIDTH                            # 0.98 m, bodies touching
+D_NEAR = 2 * ROBOT_RADIUS                          # 1.40 m, swept circles touch
+
+# Safety supervisor, DIRECTIONAL.
+#
+# An isotropic braking radius cannot work for a robot this size. Setting a
+# hard-stop ring at 1.10 m means two AMRs may never be closer than 1.10 m,
+# which forbids them passing side by side at all -- they pin each other at
+# 1.11 m and crawl at 0.007 m/s forever. Real braking is about what is in
+# your LANE ahead, not what is beside or behind you.
+#
+# So the check runs in the robot's body frame: a peer only matters if its
+# lateral offset is small enough that we would actually clip it, and it is
+# ahead of us. An omnidirectional floor still catches genuine contact.
+R_HARD = ROBOT_LEN + 0.10                          # 1.10 m ahead, in-lane
+R_SLOW = ROBOT_LEN + 1.30                          # 2.30 m ahead, in-lane
+LANE_HALF_W = ROBOT_WIDTH                          # 0.98 m lateral clearance
 
 
 @dataclass
@@ -118,6 +148,12 @@ class Robot:
         self.excluded: dict[int, set[int]] = {}  # task -> silent winners
         self.cooldown: dict[int, float] = {}     # task -> don't re-bid until
         self.stall_since: float | None = None    # self-measured, not told
+        self.charging = False                    # topping up on a bay
+        self.home_bay: tuple[int, int] | None = None
+        self.last_obstacle_bc = -1e9             # rate-limit announcements
+        self.last_waitfor_bc = -1e9
+        self.waitfor_target = 0                  # peer I believe blocks me
+        self.peer_blocked_since: dict[int, float] = {}
 
     # -- geometry ----------------------------------------------------------
 
@@ -188,6 +224,12 @@ class Robot:
                 self._on_claim(pkt.src, pkt.payload["task_id"], now)
             elif t == MsgType.RELEASE.value:
                 self._on_release(pkt.src, pkt.payload["task_id"], now)
+            elif t == MsgType.OBSTACLE.value:
+                self._on_obstacle(pkt.src, pkt.payload, now)
+            elif t == MsgType.WAIT_FOR.value:
+                p = pkt.payload
+                self.deadlock.set_edge(pkt.src, int(p.get("waiting_for", 0)))
+                self.peer_blocked_since[pkt.src] = float(p.get("blocked_since", 0.0))
         return tasks
 
     def check_degraded(self, now: float) -> None:
@@ -352,8 +394,237 @@ class Robot:
         self.phase = "none"
         self.mode = RobotMode.IDLE
 
+    # -- a stalled robot is an obstacle ------------------------------------
+
+    def announce_obstacle(self, now: float) -> None:
+        """
+        Broadcast MYSELF as a blocking obstacle once I have been stalled long
+        enough to be one.
+
+        This is the piece that makes deadlock recoverable without a central
+        referee. A wedged robot cannot free itself, but it CAN tell the fleet
+        "this cell is blocked". Peers fold that into `blocked_belief`, which
+        A* already weights by LAMBDA_BLOCK, so they route around instead of
+        queueing behind it. The belief decays at 0.05/s, so it self-clears
+        the moment the robot starts moving again -- no retraction message
+        and no stale no-go zone.
+        """
+        if self.stall_since is None or now - self.stall_since < T_OBSTACLE:
+            return
+        if now - self.last_obstacle_bc < 1.0:
+            return
+        self.last_obstacle_bc = now
+        cx, cy = self.cell
+        cells = [[cx, cy]]
+        if self.path_idx < len(self.path):          # also the cell I'm entering
+            nx, ny = self.path[self.path_idx]
+            if (nx, ny) != (cx, cy):
+                cells.append([nx, ny])
+        ob = Obstacle(header=make_header(self.id, now), cells=cells,
+                      kind=ObstacleKind.DYNAMIC.value,
+                      confidence=OBSTACLE_CONF, observed_at=now)
+        self.comms.send(wrap(ob, MsgType.OBSTACLE, self.id, BROADCAST, now), now)
+
+    def _on_obstacle(self, src: int, payload: dict, now: float) -> None:
+        """A peer says it is blocking these cells. Believe it, and reroute."""
+        cells = [tuple(c) for c in payload.get("cells", [])]
+        conf = float(payload.get("confidence", 1.0))
+        on_my_path = False
+        for (cx, cy) in cells:
+            self.table.mark_blocked(cx, cy, now, conf)
+            if (cx, cy) in self.path[self.path_idx:]:
+                on_my_path = True
+        # Only replan if it actually affects me -- replanning the whole fleet
+        # on every announcement is how you turn one stall into fleet-wide churn.
+        if on_my_path and self.goal is not None:
+            self.replan(now)
+
+    def announce_waitfor(self, now: float) -> None:
+        """
+        Publish one edge of the fleet-wide wait-for graph.
+
+        Every robot then builds the SAME graph from broadcasts and elects the
+        same yielder locally, which is what `DeadlockDetector` was designed
+        for. Previously the graph was assembled centrally by the simulation
+        and this message was never sent at all.
+        """
+        if now - self.last_waitfor_bc < T_WAITFOR:
+            return
+        self.last_waitfor_bc = now
+        blocker = 0
+        if self.stall_since is not None and self.path_idx < len(self.path):
+            tx, ty = self.wmap.to_world(*self.path[self.path_idx])
+            best_d = 1e9
+            for pid, st in self.peers.items():
+                if now - self.peer_seen_at.get(pid, -1e9) > 2.0:
+                    continue
+                d = math.hypot(st.x - self.x, st.y - self.y)
+                ahead = ((st.x - self.x) * (tx - self.x)
+                         + (st.y - self.y) * (ty - self.y)) > 0
+                if ahead and d < 3.0 and d < best_d:
+                    best_d, blocker = d, pid
+        self.waitfor_target = blocker
+        self.deadlock.set_edge(self.id, blocker)
+        wf = WaitFor(header=make_header(self.id, now), waiting_for=blocker,
+                     blocked_since=(self.stall_since or 0.0),
+                     blocking_cx=self.cell[0], blocking_cy=self.cell[1])
+        self.comms.send(wrap(wf, MsgType.WAIT_FOR, self.id, BROADCAST, now), now)
+
+    def check_deadlock(self, now: float) -> bool:
+        """
+        Detect a wait-for cycle from BROADCAST edges and decide locally
+        whether I am the one who yields.
+
+        Every robot runs this on the same graph and `choose_yielder` is
+        deterministic, so all of them reach the same answer with no
+        negotiation round-trip and no central referee. Returns True if I
+        started yielding on this tick.
+        """
+        if self.yielding or self.stall_since is None:
+            return False
+        if now - self.stall_since < T_OBSTACLE:
+            return False
+        cycle = self.deadlock.find_cycle()
+        if not cycle or self.id not in cycle:
+            return False
+
+        prios = {self.id: self.priority(now)}
+        for pid, it in self.peer_intents.items():
+            if it.priority:
+                prios[pid] = list(it.priority)
+        if DeadlockDetector.choose_yielder(cycle, prios) != self.id:
+            return False            # someone else yields; hold position
+
+        # Retreat to the nearest cell WIDE ENOUGH for two robots to pass,
+        # not to a charging bay. The bay is usually on the far side of the
+        # robot that is blocking us, so routing there means driving THROUGH
+        # the deadlock. The nearest open cell is almost always behind us,
+        # which is the direction that actually clears the corridor.
+        bay = self.nearest_wide_cell(now)
+        if not bay or bay == self.cell or self.goal is None:
+            return False
+        self.saved_goal = self.goal
+        self.goal = bay
+        self.yielding = True
+        self.yield_deadline = now + 15.0
+        self.stall_since = None
+        return self.replan(now)
+
+    def nearest_wide_cell(self, now: float,
+                          max_r: int = 14) -> tuple[int, int] | None:
+        """
+        Closest reachable cell where two AMRs can pass, by breadth-first
+        search outward from here.
+
+        A yielder must end up somewhere the other robot can get past it.
+        Retreating to another narrow cell just moves the deadlock.
+        """
+        from collections import deque
+        start = self.cell
+        seen = {start}
+        q = deque([(start, 0)])
+        while q:
+            (cx, cy), d = q.popleft()
+            if d and not self.wmap.is_narrow(cx, cy):
+                return (cx, cy)
+            if d >= max_r:
+                continue
+            for nb in self.wmap.neighbors(cx, cy):
+                if nb in seen:
+                    continue
+                # never retreat INTO a peer
+                wx, wy = self.wmap.to_world(*nb)
+                if any(math.hypot(st.x - wx, st.y - wy) < R_HARD
+                       for pid, st in self.peers.items()
+                       if now - self.peer_seen_at.get(pid, -1e9) < 2.0):
+                    continue
+                seen.add(nb)
+                q.append((nb, d + 1))
+        return None
+
+    # -- battery and charging bays ----------------------------------------
+
+    def chargers(self) -> list[tuple[int, int]]:
+        return [(n.cx, n.cy) for n in self.wmap.nodes.values()
+                if n.kind == "charger"]
+
+    def bay_taken(self, bay: tuple[int, int], now: float) -> bool:
+        """
+        Is a peer sitting on this bay, or heading to it?
+
+        Decided from BROADCAST state only -- peer position from RobotState and
+        peer destination from the last cell of their Intent path. No robot
+        reads another's variables, so "nearest VACANT bay" stays decentralised
+        and degrades honestly when comms are patchy.
+        """
+        bx, by = self.wmap.to_world(*bay)
+        for pid, st in self.peers.items():
+            if now - self.peer_seen_at.get(pid, -1e9) > 2.0:
+                continue
+            if math.hypot(st.x - bx, st.y - by) < 1.2:
+                return True
+        for pid, it in self.peer_intents.items():
+            if now - self.peer_seen_at.get(pid, -1e9) > 2.0:
+                continue
+            if it.path_cells and tuple(it.path_cells[-1]) == bay:
+                if pid < self.id:        # deterministic tie-break, both agree
+                    return True
+        return False
+
+    def nearest_free_bay(self, now: float) -> tuple[int, int] | None:
+        """Closest bay no peer has claimed. Falls back to closest if all taken."""
+        cx, cy = self.cell
+        bays = sorted(self.chargers(),
+                      key=lambda b: abs(b[0] - cx) + abs(b[1] - cy))
+        for b in bays:
+            if not self.bay_taken(b, now):
+                return b
+        return bays[0] if bays else None
+
+    def needs_charge(self) -> bool:
+        """Low enough that charging outranks work. NOT 'am I idle'."""
+        return self.battery < SOC_LOW
+
+    def at_bay(self) -> bool:
+        return self.cell in self.chargers()
+
+    def go_idle(self, now: float) -> None:
+        """
+        No work: clear the aisles and sit on the nearest vacant bay.
+
+        Parking on a bay is not the same as needing a charge. An idle robot
+        left standing in an aisle blocks every peer routed through it, so it
+        retires to a bay and tops up opportunistically while it waits.
+        """
+        bay = self.nearest_free_bay(now)
+        if bay is None:
+            return
+        self.home_bay = bay
+        self.goal = bay
+        self.mode = RobotMode.IDLE
+        self.replan(now)
+
+    def update_battery(self, dt: float, now: float) -> None:
+        """Charge on a bay; stop charging once topped up."""
+        if self.at_bay() and self.v < 0.05:
+            if self.battery < 1.0:
+                self.battery = min(1.0, self.battery + CHARGE_RATE * dt)
+                self.charging = True
+                self.mode = RobotMode.CHARGING
+            if self.charging and self.battery >= SOC_RESUME:
+                self.charging = False
+                if self.task is None:
+                    self.mode = RobotMode.IDLE
+        else:
+            self.charging = False
+
     def evaluate_task(self, task: Task, now: float) -> tuple[float, bool]:
-        if self.task is not None or self.battery < 0.25:
+        # Refuse work below SOC_LOW, and while topping up refuse until
+        # SOC_RESUME -- otherwise a robot leaves the bay at 26%, takes a job,
+        # and strands itself mid-aisle.
+        if self.task is not None or self.battery < SOC_LOW:
+            return INF_COST, False
+        if self.charging and self.battery < SOC_RESUME:
             return INF_COST, False
         cx, cy = self.cell
         p1 = plan(self.wmap, (cx, cy), (task.pickup_cx, task.pickup_cy),
@@ -428,7 +699,11 @@ class Robot:
         if nxt == -1 or nxt == here:
             return False                  # not entering a new corridor
 
-        my_dir = nxt_cell[1] - self.cell[1]
+        # Direction along whichever axis we are actually moving on. The old
+        # rule only ever looked at dy, so head-on meetings in a HORIZONTAL
+        # aisle were invisible to it and never prevented.
+        my_dx = nxt_cell[0] - self.cell[0]
+        my_dy = nxt_cell[1] - self.cell[1]
         occupants = 0
         for rid, st in self.peers.items():
             if now - self.peer_seen_at.get(rid, 0) > 2.0:
@@ -440,19 +715,22 @@ class Robot:
 
             # Infer peer heading. Its broadcast path starts at its CURRENT
             # cell, so look ahead to the first cell that actually differs.
-            their_dir = 0
-            if abs(st.vy) > 0.05:
-                their_dir = 1 if st.vy > 0 else -1
+            their_dx = their_dy = 0
+            if math.hypot(st.vx, st.vy) > 0.05:
+                their_dx = (st.vx > 0) - (st.vx < 0)
+                their_dy = (st.vy > 0) - (st.vy < 0)
             else:
                 it = self.peer_intents.get(rid)
                 if it:
                     for c in it.path_cells[:6]:
-                        if c[1] != pc[1]:
-                            their_dir = 1 if c[1] > pc[1] else -1
+                        if (c[0], c[1]) != (pc[0], pc[1]):
+                            their_dx = (c[0] > pc[0]) - (c[0] < pc[0])
+                            their_dy = (c[1] > pc[1]) - (c[1] < pc[1])
                             break
 
-            if my_dir != 0 and their_dir != 0 and my_dir * their_dir < 0:
-                return True                        # head-on: do not enter
+            # opposed on either axis -> head-on, do not enter
+            if my_dx * their_dx + my_dy * their_dy < 0:
+                return True
 
         # Capacity limit: a 3-cell-wide corridor cannot absorb a queue.
         # Holding at the mouth is cheap; gridlock inside is not.
@@ -575,15 +853,27 @@ class Robot:
             when the network is dead -- which is exactly why the fleet
             stays collision-free in degraded mode.
         """
-        R_HARD, R_SLOW = 0.50, 1.05
         v_out = v_cmd
+        hx, hy = math.cos(self.theta), math.sin(self.theta)
         for (px, py) in sensed:
-            d = math.hypot(px - self.x, py - self.y)
-            if d < R_HARD:
-                return 0.0                       # hard stop
-            if d < R_SLOW:
-                # scale linearly between hard-stop and slow radius
-                scale = (d - R_HARD) / (R_SLOW - R_HARD)
+            dx, dy = px - self.x, py - self.y
+            d = math.hypot(dx, dy)
+
+            # Omnidirectional floor: genuine body contact, whatever the bearing.
+            if d < D_COLLIDE:
+                return 0.0
+
+            fwd = dx * hx + dy * hy           # along my heading
+            lat = -dx * hy + dy * hx          # across my heading
+            if fwd <= 0.0:
+                continue                      # behind me: not my problem
+            if abs(lat) >= LANE_HALF_W:
+                continue                      # will clear me sideways
+
+            if fwd < R_HARD:
+                return 0.0                    # in my lane, too close
+            if fwd < R_SLOW:
+                scale = (fwd - R_HARD) / (R_SLOW - R_HARD)
                 v_out = min(v_out, v_cmd * scale)
         return max(0.0, v_out)
 
@@ -643,9 +933,19 @@ class Simulation:
         flags = {"congestion": congestion, "speed_adapt": speed_adapt,
                  "policy": use_policy}
 
-        starts = [(2, 2), (37, 2), (2, 27), (37, 27), (20, 2)][:n_robots]
+        # AMRs begin on charging bays, not scattered mid-aisle. A robot that
+        # starts stray is already obstructing a corridor at t=0, which biases
+        # every congestion measurement from the first tick.
+        bays = [(n.cx, n.cy) for n in sorted(self.wmap.nodes.values(),
+                                             key=lambda n: n.name)
+                if n.kind == "charger"]
+        if n_robots > len(bays):
+            raise ValueError(f"{n_robots} robots but only {len(bays)} bays")
+        starts = bays[:n_robots]
         self.robots = [Robot(i, *starts[i - 1], self.wmap, self.comms, flags)
                        for i in ids]
+        for r, b in zip(self.robots, starts):
+            r.home_bay = b
 
         self.t = 0.0
         self.metrics = Metrics()
@@ -674,9 +974,9 @@ class Simulation:
         for i, a in enumerate(self.robots):
             for b in self.robots[i + 1:]:
                 d = math.hypot(a.x - b.x, a.y - b.y)
-                if d < 0.44:
+                if d < D_COLLIDE:
                     self.metrics.collisions += 1
-                elif d < 0.8:
+                elif d < D_NEAR:
                     self.metrics.near_misses += 1
 
     def step(self) -> None:
@@ -695,6 +995,25 @@ class Simulation:
         # server never picks a winner -- it only observes, from telemetry,
         # which tasks have been taken, so it knows what is still open.
         for r in self.robots:
+            # A stalled robot announces itself as an obstacle and publishes
+            # its wait-for edge; peers reroute and elect a yielder locally.
+            r.announce_obstacle(self.t)
+            r.announce_waitfor(self.t)
+            if r.check_deadlock(self.t):
+                self.metrics.deadlocks += 1
+            r.update_battery(DT, self.t)
+            # Low battery outranks everything: hand the task back and head
+            # for a bay. Decided by the robot from its own SoC.
+            if r.needs_charge() and not r.charging:
+                if r.task is not None and r.phase == "to_pickup":
+                    r.release_task(r.task.task_id, self.t,
+                                   ReleaseReason.BATTERY)
+                if r.task is None and not r.at_bay():
+                    bay = r.nearest_free_bay(self.t)
+                    if bay and r.goal != bay:
+                        r.goal = bay
+                        r.mode = RobotMode.CHARGING
+                        r.replan(self.t)
             r.check_release(self.t)
             r.step_auction(self.t)
         held = {r.task.task_id for r in self.robots if r.task}
@@ -750,16 +1069,10 @@ class Simulation:
                     r.task, r.path = None, []
                     r.payload, r.phase = 0.0, "none"
                     r.mode = RobotMode.IDLE
-                    # Clear the aisle. An idle robot parked on a dropoff
-                    # blocks every peer routed there.
-                    park = min(
-                        [n for n in self.wmap.nodes.values()
-                         if n.kind == "charger"],
-                        key=lambda n: abs(n.cx - r.cell[0]) + abs(n.cy - r.cell[1]))
-                    r.goal = (park.cx, park.cy)
-                    r.replan(self.t)
+                    # Clear the aisle: retire to the nearest bay no peer has
+                    # claimed. The robot picks this itself from broadcast state.
+                    r.go_idle(self.t)
 
-        self.resolve_deadlocks()
         self.check_collisions()
 
     def resolve_deadlocks(self) -> None:

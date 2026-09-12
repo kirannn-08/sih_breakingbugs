@@ -116,8 +116,20 @@ class WarehouseMap:
             return self.aisle_id[cy][cx]
         return -1
 
+    # Two AMRs 0.98 m wide need this much clear width to pass each other.
+    NEED_TWO_M = 2 * 0.98 + 0.40                      # 2.36 m
+
     def _classify_zones(self) -> None:
-        """Narrow = free cell with blocked cells on both left and right."""
+        """
+        Narrow = two robots cannot pass here, measured on BOTH axes.
+
+        The previous test looked only along x, so a 16 m long by 1.50 m tall
+        cross-aisle measured 16 m of "width" and was classified OPEN. Two
+        robots would then try to sidestep past each other in a corridor that
+        physically fits one, which is unresolvable by any local method.
+        Clearance is the SMALLER of the two runs, not the larger.
+        """
+        need = self.NEED_TWO_M / CELL_SIZE            # in cells
         for y in range(H):
             for x in range(W):
                 if self.grid[y][x] != FREE:
@@ -125,11 +137,21 @@ class WarehouseMap:
                 if (x, y) in self.passing_bays:
                     self.zone[y][x] = ZONE_BAY
                     continue
-                left = self.grid[y][x - 1] != FREE if x > 0 else True
-                right = self.grid[y][x + 1] != FREE if x < W - 1 else True
-                width = self._free_run_width(x, y)
-                self.zone[y][x] = ZONE_NARROW if (left and right) or width <= 3 \
-                    else ZONE_OPEN
+                clear = min(self._free_run_width(x, y),
+                            self._free_run_height(x, y))
+                self.zone[y][x] = ZONE_NARROW if clear < need else ZONE_OPEN
+
+    def _free_run_height(self, x: int, y: int) -> int:
+        n = 1
+        yy = y - 1
+        while yy >= 0 and self.grid[yy][x] == FREE:
+            n += 1
+            yy -= 1
+        yy = y + 1
+        while yy < H and self.grid[yy][x] == FREE:
+            n += 1
+            yy += 1
+        return n
 
     def _free_run_width(self, x: int, y: int) -> int:
         n = 1
@@ -154,8 +176,16 @@ class WarehouseMap:
             Node("D1", 2, 27, "dropoff"),
             Node("D2", 20, 27, "dropoff"),
             Node("D3", 37, 27, "dropoff"),
+            # One bay per AMR, spaced 7 cells (3.5 m) apart along the open
+            # top band so two robots on adjacent bays are never inside each
+            # other's 1.40 m swept circle. "Return to the nearest VACANT bay"
+            # is meaningless with fewer bays than robots.
             Node("C1", 2, 2, "charger"),
-            Node("C2", 37, 2, "charger"),
+            Node("C2", 9, 2, "charger"),
+            Node("C3", 16, 2, "charger"),
+            Node("C4", 23, 2, "charger"),
+            Node("C5", 30, 2, "charger"),
+            Node("C6", 37, 2, "charger"),
         ]
         for n in defs:
             assert self.grid[n.cy][n.cx] == FREE, f"node {n.name} inside obstacle"
