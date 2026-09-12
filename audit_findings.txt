@@ -1,0 +1,19 @@
+Finding [Near Miss]: 1 near misses occurred. (n_robots=3, scenario=0)
+Finding [Near Miss]: 7 near misses occurred. (n_robots=4, scenario=2)
+Finding [Near Miss]: 2 near misses occurred. (n_robots=4, scenario=0)
+Finding [Near Miss]: 3 near misses occurred. (n_robots=3, scenario=2)
+
+=== EXPLICIT CODE BUGS IDENTIFIED ===
+1. CHARGING STATION OCCUPATION (bay_taken tie-breaker flaw in sim2d.py):
+   In `sim2d.py -> bay_taken()`, the tie-breaker logic is:
+   `if it.path_cells and tuple(it.path_cells[-1]) == bay: if pid < self.id: return True`
+   This means if peer `pid` is heading to the bay, we only consider it 'taken' if `pid < self.id`.
+   If `pid > self.id`, `bay_taken` returns False, leading BOTH robots to head to the same bay.
+   Fix: The tie-break must be symmetrical, or there should be a proper claim protocol for bays.
+
+2. NEAR MISSES (lidar line_of_sight braking bypass):
+   In `sim2d.py -> step()`, the LiDAR loop skips braking for peers within `D_NEAR` if they are occluded.
+   Because a rack corner can hide a crossing lane, robots approach at `v_nom` and suddenly see
+   each other inside `D_NEAR`. The brake logic applies, but only after they are already dangerously close,
+   leading to numerous near-misses being recorded at blind corners.
+   Fix: AMRs must slow down prophylactically when approaching blind corners (`is_blind_corner`).
