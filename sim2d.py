@@ -21,10 +21,10 @@ from amr_msgs import (BROADCAST, INF_COST, Bid, Claim, Header, Intent, MsgType,
                       Release, ReleaseReason, RobotMode, RobotState, Task,
                       make_header, wrap)
 from comms import CommsMediator
-from coordination import (T_BID, T_CLAIM, T_REBID, V_MIN, DeadlockDetector,
-                          adapt_speed, bid_cost, conflict_risk, feasible,
-                          first_conflict, make_priority, resolve_auction,
-                          sample_trajectory)
+from coordination import (T_BID, T_CLAIM, T_COOLDOWN, T_REBID, T_RELEASE,
+                          V_MIN, DeadlockDetector, adapt_speed, bid_cost,
+                          conflict_risk, feasible, first_conflict, has_quorum,
+                          make_priority, resolve_auction, sample_trajectory)
 from planner import (ReservationTable, congestion_cost, path_length_m, plan,
                      path_to_reservations)
 from warehouse_map import CELL_SIZE, WarehouseMap
@@ -116,6 +116,8 @@ class Robot:
         self.claim_due: dict[int, float] = {}    # task -> Claim deadline
         self.rebid_at: dict[int, float] = {}     # task -> next retry
         self.excluded: dict[int, set[int]] = {}  # task -> silent winners
+        self.cooldown: dict[int, float] = {}     # task -> don't re-bid until
+        self.stall_since: float | None = None    # self-measured, not told
 
     # -- geometry ----------------------------------------------------------
 
@@ -236,6 +238,18 @@ class Robot:
                     if r not in ruled_out}
             winner = resolve_auction(bids)
             task = self.known_tasks.get(tid)
+
+            # NO QUORUM, NO COMMIT. Hearing only yourself is not winning an
+            # auction, it is being alone. Without this a blackout makes every
+            # robot the sole bidder and all of them take the same task.
+            if winner == self.id and not has_quorum(len(bids),
+                                                    len(self.comms.ids)):
+                self.claim_due.pop(tid, None)
+                self.rebid_at[tid] = now + T_REBID
+                if self.task is None and self.mode == RobotMode.BIDDING:
+                    self.mode = RobotMode.IDLE
+                continue
+
             if winner == self.id and self.task is None and task is not None:
                 self.claimed[tid] = self.id
                 clm = Claim(header=make_header(self.id, now), task_id=tid,
@@ -270,8 +284,33 @@ class Robot:
             if tid in self.claimed or tid not in self.known_tasks:
                 self.rebid_at.pop(tid, None)
                 continue
+            if now < self.cooldown.get(tid, 0.0):
+                continue          # I just gave this one back -- let a peer try
             self.pending_bids.pop(tid, None)
             self.submit_bid(self.known_tasks[tid], now)
+
+    def check_release(self, now: float) -> None:
+        """
+        Give a task back if I have been stalled too long trying to FETCH it.
+
+        The fleet previously had no way to undo an allocation: a robot wedged
+        in a deadlock held its task forever while peers that could have done
+        it sat idle and the task never returned to auction. `ReleaseReason`
+        declared BLOCKED for exactly this and nothing ever used it.
+
+        Only ever released in the `to_pickup` phase. Once loaded the robot is
+        physically holding the pallet, so handing the task to a peer would be
+        a lie -- a carrying robot must finish or be unloaded by a human.
+        """
+        if self.task is None or self.yielding or self.phase != "to_pickup":
+            return
+        if self.stall_since is None or now - self.stall_since < T_RELEASE:
+            return
+        tid = self.task.task_id
+        self.cooldown[tid] = now + T_COOLDOWN
+        self.claimed.pop(tid, None)
+        self.release_task(tid, now, ReleaseReason.BLOCKED)
+        self.stall_since = None
 
     def _on_claim(self, src: int, tid: int, now: float) -> None:
         """
@@ -557,6 +596,12 @@ class Robot:
         v_cmd = self.decide_speed(now)
         # L2 has the last word, always.
         self.v = self.safety_supervisor(v_cmd, sensed or [])
+        # Measure my own stall. Do not wait to be told by a central observer.
+        if self.v < 0.05:
+            if self.stall_since is None:
+                self.stall_since = now
+        else:
+            self.stall_since = None
         if self.v < 0.01:
             self.stopped_time += dt
             return
@@ -650,11 +695,19 @@ class Simulation:
         # server never picks a winner -- it only observes, from telemetry,
         # which tasks have been taken, so it knows what is still open.
         for r in self.robots:
+            r.check_release(self.t)
             r.step_auction(self.t)
         held = {r.task.task_id for r in self.robots if r.task}
         for tid in list(self.open_tasks):
             if tid in held:
                 self.open_tasks.pop(tid)
+        # a task handed back by a stalled robot is open again (telemetry only --
+        # the robots re-auction it among themselves regardless)
+        for r in self.robots:
+            for tid in r.known_tasks:
+                if tid not in held and tid not in self.open_tasks \
+                        and tid < self.next_task_id and r.cooldown.get(tid):
+                    self.open_tasks[tid] = r.known_tasks[tid]
 
         for r in self.robots:
             # Simulated LiDAR: geometric detection of anything within range.
@@ -685,7 +738,15 @@ class Simulation:
                     r.replan(self.t)
                 else:
                     self.metrics.tasks_completed += 1
-                    self.metrics.task_times.append(self.t - r.task_start_t)
+                    # Measure from ANNOUNCEMENT, not from the last accept.
+                    # task_start_t resets every time a task is accepted, so a
+                    # task released by a stalled robot and picked up by a peer
+                    # would only be timed from the final successful attempt --
+                    # the failed attempt would vanish from the metric. Timing
+                    # from announced_at is the operator's truth and cannot be
+                    # gamed by re-allocation. It also folds in allocation
+                    # latency, which was previously excluded.
+                    self.metrics.task_times.append(self.t - r.task.announced_at)
                     r.task, r.path = None, []
                     r.payload, r.phase = 0.0, "none"
                     r.mode = RobotMode.IDLE

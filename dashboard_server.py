@@ -31,7 +31,7 @@ import tornado.websocket
 
 from amr_msgs import (BROADCAST, INF_COST, Bid, Claim, Header, Intent, MsgType,
                       Release, RobotMode, RobotState, Task, make_header, wrap)
-from comms import CommsMediator
+from comms import CommsMediator, DeadZone
 from coordination import DeadlockDetector, adapt_speed, resolve_auction
 from learned import OBS_DIM, PolicyNet
 from planner import path_to_reservations
@@ -264,6 +264,37 @@ class SimulationManager:
             self.sim.comms.cut_everything()
             self.log_event("COMMS", "TOTAL COMMS BLACKOUT: All peer-to-peer links cut across fleet", "error")
 
+    def add_dead_zone(self, x0: float, y0: float, x1: float, y1: float,
+                      deliver_prob: float = 0.1) -> None:
+        """
+        RF hole: a rectangle where packets mostly do not get through.
+
+        Different from cutting a link. A cut is per-pair and permanent until
+        restored; a dead zone is geographic and probabilistic, so a robot
+        loses and regains peers as it DRIVES through it. That is what metal
+        racking actually does, and it is the failure the fleet will meet on
+        real hardware.
+        """
+        if not self.sim:
+            return
+        x0, x1 = min(x0, x1), max(x0, x1)
+        y0, y1 = min(y0, y1), max(y0, y1)
+        self.sim.comms.dead_zones.append(
+            DeadZone(x0, y0, x1, y1, deliver_prob=max(0.0, min(1.0, deliver_prob))))
+        self.log_event(
+            "COMMS",
+            f"RF dead zone added: ({x0:.1f},{y0:.1f}) to ({x1:.1f},{y1:.1f}), "
+            f"{deliver_prob * 100:.0f}% delivery inside",
+            "warning",
+            {"x0": x0, "y0": y0, "x1": x1, "y1": y1, "deliver_prob": deliver_prob})
+
+    def clear_dead_zones(self) -> None:
+        if not self.sim:
+            return
+        n = len(self.sim.comms.dead_zones)
+        self.sim.comms.dead_zones.clear()
+        self.log_event("COMMS", f"Cleared {n} RF dead zone(s)", "success")
+
     def restore_all_links(self) -> None:
         if self.sim:
             self.sim.comms.restore_all()
@@ -492,6 +523,13 @@ class SimulationManager:
                 "stats": sim.comms.stats()
             },
             "auction": self._auction_summary(),
+            "dead_zones": [
+                {"x0": dz.x0, "y0": dz.y0, "x1": dz.x1, "y1": dz.y1,
+                 "deliver_prob": dz.deliver_prob,
+                 "robots_inside": [r.id for r in sim.robots
+                                   if dz.contains(r.x, r.y)]}
+                for dz in sim.comms.dead_zones
+            ],
             "tasks": {
                 "open": open_tasks,
                 "active": active_tasks,
@@ -648,6 +686,12 @@ def dispatch_action(cmd: dict[str, Any]) -> dict[str, Any]:
         MANAGER.cut_all_links()
     elif action == "restore_all":
         MANAGER.restore_all_links()
+    elif action == "add_dead_zone":
+        MANAGER.add_dead_zone(float(cmd["x0"]), float(cmd["y0"]),
+                              float(cmd["x1"]), float(cmd["y1"]),
+                              float(cmd.get("deliver_prob", 0.1)))
+    elif action == "clear_dead_zones":
+        MANAGER.clear_dead_zones()
     elif action == "set_loss_rate":
         MANAGER.set_loss_rate(float(cmd["rate"]))
     elif action == "kill_server":

@@ -18,9 +18,19 @@ A server broadcasts tasks and collects telemetry — it never commands.
 
 ## Current state
 
-- 51 tests passing (`python3 -m pytest tests/ -q`)
-- Default map: **+22.1%** task-time reduction vs stop-and-wait, **0 collisions**, 10 seeds
-- B4 @ 20% loss: **+16.2%** — now *below* B3, which is correct (see flaw 1, fixed)
+- 57 tests passing (`python3 -m pytest tests/ -q`) — includes the dashboard suite
+- Default map: **+23.1%** task-time reduction vs stop-and-wait, **0 collisions**, 10 seeds
+- **Task time is measured from `announced_at`, not from the last accept.** Tasks
+  can now be released and re-auctioned; timing from the final accept would
+  silently discard every failed attempt. This folds allocation latency in, so
+  absolute times rose (B0 42.8 → 47.9 s) while the ratio held.
+- B4 @ 20% loss: **+26.2%** vs B3's +23.1% — a 0.49 sigma difference, i.e.
+  **statistically indistinguishable**, not "loss helps". Do not quote B4 as better.
+- **Congestion-aware routing alone (B1) is worth nothing**: +0.18 s vs B0, inside
+  noise. Speed adaptation carries the result (B2 alone = +21.0%). Likely a
+  symptom of flaw 2 — a time-dependent cost driven by a search with no time in
+  its state produces detours without benefit.
+- Dashboard: `python3 dashboard_server.py --port 8080` (needs tornado)
 - SIH layout: **`run_sih_layout.py` is broken** — it calls
   `Simulation(wmap=..., starts=...)` and `Simulation.__init__` accepts neither,
   so it raises `TypeError` before running. Pre-existing, predates the auction
@@ -32,7 +42,7 @@ A server broadcasts tasks and collects telemetry — it never commands.
 ## Commands
 
 ```bash
-python3 -m pytest tests/ -q      # 51 tests, ~17 s
+python3 -m pytest tests/ -q      # 57 tests, ~10 s
 python3 run_benchmark.py 10      # headline number
 python3 run_sih_layout.py        # the SIH drawing's layout
 python3 demo_scenarios.py        # 7 demo scenarios

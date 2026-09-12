@@ -29,6 +29,8 @@ ALPHA, BETA, GAMMA, DELTA, EPSILON = 1.0, 0.5, 40.0, 15.0, 8.0
 T_BID = 0.3        # bid collection window
 T_CLAIM = 0.4      # wait for the believed winner's Claim before re-running
 T_REBID = 0.5      # retry cadence for a task nobody could take yet
+T_RELEASE = 8.0    # stalled this long while fetching -> give the task back
+T_COOLDOWN = 12.0  # ...and don't re-bid on it for this long
 
 # conflict prediction (doc E.4)
 HORIZON = 10.0
@@ -80,6 +82,23 @@ def bid_cost(eta: float, congestion: float, energy_needed: float,
             + GAMMA * (energy_needed / energy_available)
             + DELTA * queue_len
             + EPSILON * conflict_risk)
+
+
+def has_quorum(n_bidders: int, fleet_size: int) -> bool:
+    """
+    May a robot COMMIT to a task on the evidence it has?
+
+    A robot that cannot hear its peers hears only its own bid, so it always
+    "wins" -- and in a blackout every robot wins the same task and four AMRs
+    drive to one pallet. Requiring a majority of the fleet to have been heard
+    turns that silent duplicate allocation into an honest refusal to commit.
+
+    This is the standard no-quorum-no-commit rule. A lone robot (fleet of 1)
+    is trivially its own majority.
+    """
+    if fleet_size <= 1:
+        return True
+    return n_bidders * 2 > fleet_size
 
 
 def resolve_auction(bids: dict[int, tuple[float, bool]]) -> int:
