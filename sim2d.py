@@ -23,11 +23,12 @@ from amr_msgs import (BROADCAST, INF_COST, Bid, Claim, Header, Intent, MsgType,
 from comms import CommsMediator
 from perception import (LIDAR_BLOCK_CONF, LidarTracker)
 from coordination import (CHARGE_RATE, OBSTACLE_CONF, SOC_LOW, SOC_RESUME,
-                          T_BID, T_CLAIM, T_COOLDOWN, T_OBSTACLE, T_REBID,
-                          T_RELEASE, T_WAITFOR, V_MIN,
+                          T_BACKOUT, T_BID, T_CLAIM, T_COOLDOWN, T_OBSTACLE,
+                          T_REBID, T_RELEASE, T_WAITFOR, V_MIN,
                           DeadlockDetector, adapt_speed, bid_cost,
                           conflict_risk, feasible, first_conflict, has_quorum,
-                          make_priority, resolve_auction, sample_trajectory)
+                          make_priority, predicted_head_on, resolve_auction,
+                          sample_trajectory, segment_windows)
 from planner import (ReservationTable, congestion_cost, path_length_m, plan,
                      path_to_reservations)
 from warehouse_map import CELL_SIZE, WarehouseMap
@@ -77,6 +78,7 @@ T_LIDAR_REPLAN = 2.0        # min gap between LiDAR-triggered replans
 V_BLIND = 0.30
 D_BLIND_LOOKAHEAD = 1.5     # m of path ahead scanned for a blind corner
 T_BLIND_REACT = 1.5         # s of peer travel to treat as 'could be there'
+SEG_TIE = 0.5               # entry times within this are a dead heat
 
 
 @dataclass
@@ -99,6 +101,9 @@ class Metrics:
     lidar_decisions: int = 0
     lidar_replans: int = 0
     blind_slowdowns: int = 0
+    backouts: int = 0
+    backouts_done: int = 0
+    entry_deferrals: int = 0
 
     def summary(self) -> dict:
         n = max(1, len(self.task_times))
@@ -120,6 +125,12 @@ class Metrics:
             "lidar_decisions": self.lidar_decisions,
             "lidar_replans": self.lidar_replans,
             "blind_slowdowns": self.blind_slowdowns,
+            "backouts": self.backouts,
+            "backouts_done": self.backouts_done,
+            "entry_deferrals": self.entry_deferrals,
+            "avg_recovery_s": round(
+                sum(self.deadlock_recovery_s)
+                / max(1, len(self.deadlock_recovery_s)), 2),
         }
 
 
@@ -188,6 +199,22 @@ class Robot:
         self.lidar_replans = 0
         self.blind_slowdowns = 0
         self.peer_blocked_since: dict[int, float] = {}
+        # -- CONTESTED-REGION STACK.
+        # `trail` is the cells I have actually occupied, oldest first. It is
+        # the only escape route guaranteed to be drivable and, for the last
+        # robot into a corridor, guaranteed to be empty. `region_entered_at`
+        # is my push timestamp; peers learn it from WaitFor and every robot
+        # in a cycle then pops the same one.
+        self.trail: list[tuple[int, int]] = [(cx, cy)]
+        self.region = -1
+        self.region_entered_at = 0.0
+        self.backing_out = False
+        self.backout_deadline = 0.0
+        self.peer_entered_at: dict[int, float] = {}
+        self.peer_dist_to_block: dict[int, float] = {}
+        self.backouts = 0
+        self.backouts_done = 0
+        self.entry_deferrals = 0
 
     # -- geometry ----------------------------------------------------------
 
@@ -264,6 +291,13 @@ class Robot:
                 p = pkt.payload
                 self.deadlock.set_edge(pkt.src, int(p.get("waiting_for", 0)))
                 self.peer_blocked_since[pkt.src] = float(p.get("blocked_since", 0.0))
+                # Stack stamps (schema 1.1.0). A peer on an older schema omits
+                # them and defaults to 0.0, which sorts as the OLDEST entrant --
+                # so a robot that cannot report its stamp is never elected to
+                # back out. Missing evidence must not volunteer a victim.
+                self.peer_entered_at[pkt.src] = float(p.get("entered_at", 0.0))
+                self.peer_dist_to_block[pkt.src] = float(
+                    p.get("dist_to_block", 0.0)) or 1e9
         return tasks
 
     def check_degraded(self, now: float) -> None:
@@ -501,48 +535,117 @@ class Robot:
         self.deadlock.set_edge(self.id, blocker)
         wf = WaitFor(header=make_header(self.id, now), waiting_for=blocker,
                      blocked_since=(self.stall_since or 0.0),
-                     blocking_cx=self.cell[0], blocking_cy=self.cell[1])
+                     blocking_cx=self.cell[0], blocking_cy=self.cell[1],
+                     entered_at=self.region_entered_at,
+                     segment_id=self.region,
+                     dist_to_block=(best_d if blocker else 0.0),
+                     backing_out=self.backing_out)
         self.comms.send(wrap(wf, MsgType.WAIT_FOR, self.id, BROADCAST, now), now)
 
     def check_deadlock(self, now: float) -> bool:
         """
         Detect a wait-for cycle from BROADCAST edges and decide locally
-        whether I am the one who yields.
+        whether I am the one who backs out.
 
-        Every robot runs this on the same graph and `choose_yielder` is
-        deterministic, so all of them reach the same answer with no
-        negotiation round-trip and no central referee. Returns True if I
-        started yielding on this tick.
+        Resolution is LIFO: the cycle member that entered the contested
+        region LAST pops off the stack and reverses along its own trail.
+        `choose_yielder_lifo` is deterministic and every robot runs it on the
+        same broadcast data, so all of them elect the same robot with no
+        negotiation round-trip and no referee.
+
+        Why this replaced "lowest priority yields": the old rule could elect
+        a robot buried at the far end of an aisle whose only exit ran through
+        the peer it was deadlocked with, so it retreated into a cell another
+        cycle member needed and the jam survived. Measured on seed 3, nine
+        detected deadlocks produced no recovery at all and a 2-cycle held for
+        4589 robot-ticks. The last robot in is the one nearest the entrance,
+        and the stretch behind it is the stretch it has just driven.
         """
-        if self.yielding or self.stall_since is None:
+        if self.backing_out or self.yielding or self.stall_since is None:
             return False
         if now - self.stall_since < T_OBSTACLE:
             return False
         cycle = self.deadlock.find_cycle()
-        if not cycle or self.id not in cycle:
+        if not cycle:
+            return False
+        # The stack is the cycle plus everyone queued behind it: resolving a
+        # jam means moving whoever is physically in the way, and that robot is
+        # very often a mere waiter rather than a cycle member.
+        stack = self.deadlock.blocked_set(cycle)
+        if self.id not in stack:
             return False
 
         prios = {self.id: self.priority(now)}
         for pid, it in self.peer_intents.items():
             if it.priority:
                 prios[pid] = list(it.priority)
-        if DeadlockDetector.choose_yielder(cycle, prios) != self.id:
-            return False            # someone else yields; hold position
+        entered = dict(self.peer_entered_at)
+        entered[self.id] = self.region_entered_at
+        dists = dict(self.peer_dist_to_block)
+        dists[self.id] = self.dist_to_blocker(now)
 
-        # Retreat to the nearest cell WIDE ENOUGH for two robots to pass,
-        # not to a charging bay. The bay is usually on the far side of the
-        # robot that is blocking us, so routing there means driving THROUGH
-        # the deadlock. The nearest open cell is almost always behind us,
-        # which is the direction that actually clears the corridor.
-        bay = self.nearest_wide_cell(now)
-        if not bay or bay == self.cell or self.goal is None:
+        if DeadlockDetector.choose_yielder_lifo(
+                stack, entered, dists, prios) != self.id:
+            return False            # someone else pops; hold position
+
+        return self.start_backout(now)
+
+    def dist_to_blocker(self, now: float) -> float:
+        """Metres to the peer I believe blocks me. Broadcast, and a LIFO tiebreak."""
+        st = self.peers.get(self.waitfor_target)
+        if st is None:
+            return 1e9
+        return math.hypot(st.x - self.x, st.y - self.y)
+
+    def backout_target(self, now: float) -> list[tuple[int, int]] | None:
+        """
+        Reverse along my own trail to the first cell where a peer can pass me.
+
+        Deliberately NOT a replan. A* would route me to that cell through
+        whatever looks cheapest, which in a jam is straight back through the
+        robots I am deadlocked with. My trail is the one route I know is
+        physically drivable, and -- because I am the last robot into this
+        region -- the one route no cycle member is standing in.
+        """
+        if len(self.trail) < 2:
+            return None
+        route: list[tuple[int, int]] = []
+        for cell in reversed(self.trail[:-1]):
+            wx, wy = self.wmap.to_world(*cell)
+            occupied = any(
+                math.hypot(st.x - wx, st.y - wy) < ROBOT_WIDTH
+                for pid, st in self.peers.items()
+                if now - self.peer_seen_at.get(pid, -1e9) < 2.0)
+            if occupied:
+                break                      # cannot reverse past a peer
+            route.append(cell)
+            if not self.wmap.is_narrow(*cell):
+                return route               # wide enough to be passed here
+        return None                        # no passing point behind me
+
+    def start_backout(self, now: float) -> bool:
+        route = self.backout_target(now)
+        if not route:
             return False
         self.saved_goal = self.goal
-        self.goal = bay
-        self.yielding = True
-        self.yield_deadline = now + 15.0
+        self.path, self.path_idx = route, 0
+        self.backing_out = True
+        self.backout_deadline = now + T_BACKOUT
         self.stall_since = None
-        return self.replan(now)
+        self.backouts += 1
+        return True
+
+    def finish_backout(self, now: float) -> None:
+        """Resume the real goal once clear, or on timeout."""
+        self.backing_out = False
+        self.backouts_done += 1
+        self.goal = self.saved_goal
+        self.saved_goal = None
+        self.blocked_since = 0.0
+        self.stall_since = None
+        self.trail = [self.cell]
+        if self.goal:
+            self.replan(now)
 
     def nearest_wide_cell(self, now: float,
                           max_r: int = 14) -> tuple[int, int] | None:
@@ -772,6 +875,45 @@ class Robot:
 
     # -- decisions from LOCAL SENSING (no comms) ---------------------------
 
+    def current_region(self) -> int:
+        """
+        Which contested region am I in? -1 = none.
+
+        A region is an aisle segment. A robot sitting in the MOUTH of an
+        aisle counts as contesting that aisle even though the mouth cell is
+        open: the wedge that motivated all of this had two of its four robots
+        standing in mouth cells, and a region test that excluded them gave
+        those two no entry stamp and therefore no place in the stack.
+        """
+        seg = self.wmap.aisle_at(*self.cell)
+        if seg >= 0:
+            return seg
+        for nb in self.wmap.neighbors(*self.cell):
+            s2 = self.wmap.aisle_at(*nb)
+            if s2 >= 0:
+                return s2
+        return -1
+
+    def update_region(self, now: float) -> None:
+        """Push on entering a region; the stamp is what LIFO pops on."""
+        reg = self.current_region()
+        if reg != self.region:
+            self.region = reg
+            self.region_entered_at = now if reg >= 0 else 0.0
+
+    def note_trail(self) -> None:
+        cell = self.cell
+        if self.trail and self.trail[-1] == cell:
+            return
+        # Reversing over my own trail must not leave a loop behind me, or the
+        # backout walks in circles. If I have stepped back onto a cell I
+        # already occupied, truncate to it.
+        if cell in self.trail:
+            self.trail = self.trail[:self.trail.index(cell) + 1]
+        else:
+            self.trail.append(cell)
+        del self.trail[:-60]
+
     def approaching_blind_corner(self, now: float) -> bool:
         """
         Should I drive at sight-limited speed right now?
@@ -890,6 +1032,62 @@ class Robot:
             self.stops += 1
         return v_new
 
+    def segment_entry_deferred(self, now: float) -> bool:
+        """
+        PREDICTIVE. Refuse to enter an aisle I am forecast to jam.
+
+        `corridor_blocked` only ever asked whether a peer is inside the aisle
+        RIGHT NOW. That is too late: two robots converging on opposite mouths
+        both see an empty corridor, both enter, and no velocity solution
+        exists once they are in. Every wedge measured on this map formed that
+        way.
+
+        Here each robot derives, from the `Intent` path cells its peers
+        already broadcast, WHEN each of them will be inside each segment and
+        WHICH WAY -- so an opposed overlap is visible while both robots are
+        still outside and either can still cheaply stop.
+
+        Who defers is decided the same way the stack pops: whoever would
+        enter LATER waits. First come, first served; the later arrival holds
+        at the mouth for a few seconds instead of buying a deadlock. Both
+        robots compute the identical comparison from the identical broadcast
+        data, so they cannot both defer (which would livelock) and cannot
+        both proceed. Simultaneous entries inside SEG_TIE are split by
+        priority, which is a total order.
+
+        No new message type: this is the Intent that was already on the air.
+        """
+        if self.path_idx >= len(self.path) or self.backing_out:
+            return False
+        nxt = self.path[self.path_idx]
+        seg = self.wmap.aisle_at(*nxt)
+        if seg < 0 or seg == self.wmap.aisle_at(*self.cell):
+            return False                      # not entering a new segment
+
+        mine = segment_windows(self.path[self.path_idx:], now, self.v_nom,
+                               self.wmap)
+        theirs = {}
+        for pid, it in self.peer_intents.items():
+            if now - self.peer_seen_at.get(pid, -1e9) > 2.0:
+                continue
+            theirs[pid] = segment_windows(
+                [tuple(c) for c in it.path_cells], now,
+                max(0.05, it.nominal_speed), self.wmap)
+        hit = predicted_head_on(mine, theirs)
+        if hit is None:
+            return False
+        seg_id, pid, my_entry = hit
+        their_entry = min((w[1] for w in theirs[pid] if w[0] == seg_id),
+                          default=1e9)
+        if my_entry < their_entry - SEG_TIE:
+            return False                      # I get there first, go
+        if abs(my_entry - their_entry) <= SEG_TIE:
+            peer_p = self.peer_intents[pid].priority or [1e9]
+            if tuple(self.priority(now)) < tuple(peer_p):
+                return False                  # dead heat, I have right of way
+        self.entry_deferrals += 1
+        return True
+
     def decide_speed(self, now: float) -> float:
         """
         Speed adaptation (doc E.6). This is the mechanism that beats
@@ -898,7 +1096,12 @@ class Robot:
         """
         # corridor reservation applies to BOTH arms (it is a safety rule,
         # not the mechanism under test)
-        if self.corridor_blocked(now):
+        # Both evaluated, deliberately not short-circuited: an `or` would
+        # leave the predictive rule uncounted whenever the reactive one fired
+        # first, and an uncounted rule is indistinguishable from a dead one.
+        reactive = self.corridor_blocked(now)
+        predictive = self.segment_entry_deferred(now)
+        if reactive or predictive:
             return 0.0
 
         # Drive within sight distance. Geometry, not comms -- it holds in a
@@ -1050,6 +1253,8 @@ class Robot:
         # needs to know what is around it, and its tracks must not go stale
         # and then jump when it sets off again.
         self.lidar.update(sensed or [], now, dt)
+        self.update_region(now)
+        self.note_trail()
         if not self.path or self.path_idx >= len(self.path):
             self.v = 0.0
             return
@@ -1219,6 +1424,17 @@ class Simulation:
                 sensed.append((o.x, o.y))
             r.step(self.t, DT, sensed)
 
+            # Backout complete -> resume the real goal. Recovery time is
+            # measured from the moment the stack was popped, not per tick:
+            # the old code appended DT to deadlock_recovery_s, which recorded
+            # the sampling interval rather than how long recovery took.
+            if r.backing_out and (r.path_idx >= len(r.path)
+                                  or self.t > r.backout_deadline):
+                self.metrics.deadlock_recovery_s.append(
+                    self.t - (r.backout_deadline - T_BACKOUT))
+                r.finish_backout(self.t)
+                continue
+
             # yield complete -> resume the original goal
             if r.yielding and (r.path_idx >= len(r.path)
                                or self.t > r.yield_deadline):
@@ -1337,6 +1553,10 @@ class Simulation:
                                            for r in self.robots)
         self.metrics.lidar_replans = sum(r.lidar_replans for r in self.robots)
         self.metrics.blind_slowdowns = sum(r.blind_slowdowns
+                                           for r in self.robots)
+        self.metrics.backouts = sum(r.backouts for r in self.robots)
+        self.metrics.backouts_done = sum(r.backouts_done for r in self.robots)
+        self.metrics.entry_deferrals = sum(r.entry_deferrals
                                            for r in self.robots)
         out = self.metrics.summary()
         out["comms"] = self.comms.stats()

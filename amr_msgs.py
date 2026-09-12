@@ -31,7 +31,7 @@ from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Any
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.1.0"
 
 BROADCAST = 0  # robot_id 0 means "to everyone" / "no robot"
 
@@ -260,6 +260,18 @@ class WaitFor:
     blocked_since: float = 0.0
     blocking_cx: int = -1
     blocking_cy: int = -1
+    # -- ADDED in schema 1.1.0, additive only: every field below defaults, so
+    # a 1.0.0 receiver decodes a 1.1.0 WaitFor unchanged. Flagged here rather
+    # than edited silently, per the frozen-contract rule.
+    #
+    # These three are the input to LIFO deadlock resolution. A cycle is
+    # broken by the robot that entered the contested region LAST, and that
+    # cannot be computed from position alone -- it needs the entry stamp,
+    # which only the entering robot knows.
+    entered_at: float = 0.0           # when I entered my contested region
+    segment_id: int = -1              # aisle segment I am contesting, -1 = none
+    dist_to_block: float = 0.0        # metres from me to the robot blocking me
+    backing_out: bool = False         # I am reversing along my own trail
 
 
 # --------------------------------------------------------------------------

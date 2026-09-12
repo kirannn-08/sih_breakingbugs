@@ -59,6 +59,31 @@ HYSTERESIS = 0.08
 T_STALL = 3.0
 V_STALL = 0.05
 
+# LIFO deadlock resolution.
+#
+# The cycle member that entered the contested region LAST backs out. This is
+# a stack: entering a corridor pushes, resolving pops, and it pops from the
+# top. Two reasons, one practical and one structural.
+#
+# Practical: in a corridor the last robot in is by construction the one
+# NEAREST the entrance, so its escape route is the stretch it has just driven
+# and nobody is standing in it -- anyone behind it entered later still and has
+# already been popped. Yielding by priority has no such guarantee: it can
+# elect a robot buried at the far end of the aisle, whose only way out is
+# through the very peer it is deadlocked with. That is exactly what was
+# happening here, and it is why nine detected deadlocks produced no recovery.
+#
+# Structural: this is timestamp deadlock resolution -- Rosenkrantz, Stearns &
+# Lewis (1978), the WAIT-DIE rule from distributed databases. Younger
+# transaction aborts, older one proceeds. It is starvation-free for the same
+# reason theirs is: a robot's entry stamp only gets older relative to new
+# arrivals, so a robot cannot be chosen to yield forever.
+T_BACKOUT = 20.0     # give up on a backout that has not cleared in this long
+LIFO_EPS = 0.25      # entry stamps within this are a tie -> distance decides
+
+# predictive segment reservation
+SEG_HORIZON = 14.0   # s of announced path scanned for segment traversals
+
 
 # --------------------------------------------------------------------------
 # 1. Consensus sealed-bid auction
@@ -272,6 +297,74 @@ class DeadlockDetector:
                 node = self.edges[node]
         return []
 
+    def blocked_set(self, cycle: list[int]) -> list[int]:
+        """
+        The cycle PLUS everyone queued behind it -- the whole stack.
+
+        This is the correction that made LIFO actually work. A cycle names the
+        robots that are deadlocked, but not the robots whose bodies are in the
+        way of resolving it. Measured on seed 3: the cycle was {2,4}, robot 2
+        was correctly and unanimously elected to back out, and it failed to do
+        so 1146 times running because robot 1 -- merely QUEUED behind robot 2,
+        never part of the cycle -- was parked in its reverse path.
+
+        Robot 1 had entered the aisle at t=68.2 against robot 2's t=48.8, so
+        it was the true top of the stack and should have popped first. Electing
+        from the cycle alone could never see that.
+
+        So the resolution set is the cycle plus the transitive closure of
+        wait-for edges leading INTO it. Popping its latest entrant frees the
+        next one down, and the stack unwinds in reverse order of entry.
+        """
+        if not cycle:
+            return []
+        members = set(cycle)
+        changed = True
+        while changed:                      # walk the wait-for tree inward
+            changed = False
+            for waiter, blocker in self.edges.items():
+                if blocker in members and waiter not in members:
+                    members.add(waiter)
+                    changed = True
+        return sorted(members)
+
+    @staticmethod
+    def choose_yielder_lifo(cycle: list[int],
+                            entered_at: dict[int, float],
+                            dist_to_block: dict[int, float],
+                            priorities: dict[int, list[float]]) -> int:
+        """
+        LIFO: the LAST robot into the contested region backs out.
+
+        Every robot in the cycle computes this from broadcast WaitFor fields
+        and gets the same answer, so there is still no negotiation round-trip
+        and no referee.
+
+        Ordering, in full:
+          1. latest `entered_at`  -- the top of the stack
+          2. then SHORTEST distance to the blocking robot. Two robots that
+             entered a corridor from opposite ends within LIFO_EPS have no
+             meaningful stack order, so the tie goes to whoever is closest to
+             the pinch point: it has the least corridor to clear and frees
+             the jam soonest.
+          3. then lowest priority, then highest id -- both total and
+             deterministic, so the answer can never be ambiguous.
+
+        A robot with no entry stamp (never entered a tracked region, or its
+        WaitFor was lost) reports 0.0 and therefore sorts as the OLDEST
+        entrant. Missing evidence must never volunteer a robot to yield --
+        that would let a dropped packet elect a victim.
+        """
+        if not cycle:
+            return 0
+        top = max(entered_at.get(r, 0.0) for r in cycle)
+        tied = [r for r in cycle
+                if top - entered_at.get(r, 0.0) <= LIFO_EPS]
+        return min(tied, key=lambda r: (dist_to_block.get(r, 1e9),
+                                        [-v for v in
+                                         priorities.get(r, [-1e9])],
+                                        -r))
+
     @staticmethod
     def choose_yielder(cycle: list[int],
                        priorities: dict[int, list[float]]) -> int:
@@ -288,3 +381,73 @@ def make_priority(priority_class: int, deadline: float, eta: float,
                   battery_soc: float, robot_id: int) -> list[float]:
     slack = (deadline - eta) if deadline > 0 else 1e6
     return priority_tuple(priority_class, slack, battery_soc, robot_id)
+
+
+# --------------------------------------------------------------------------
+# 5. Predictive segment reservation  --  do not enter a jam you can foresee
+# --------------------------------------------------------------------------
+
+def segment_windows(path: list[tuple[int, int]], t_start: float, v_nom: float,
+                    wmap, horizon: float = SEG_HORIZON
+                    ) -> list[tuple[int, float, float, int, int]]:
+    """
+    Turn an announced path into (segment_id, t_enter, t_exit, dx, dy) claims.
+
+    A robot already broadcasts its path cells in `Intent`. Every peer can
+    therefore derive, with no new message type, WHEN that robot will be inside
+    each narrow aisle segment and WHICH WAY it will be going. That is the
+    whole input to predicting a head-on jam before either robot has committed
+    to it -- and predicting it is the only affordable fix, because once both
+    are inside a one-robot-wide corridor no velocity solution exists.
+
+    Direction is taken over the whole traversal, not cell to cell: a path that
+    jogs sideways within an aisle still has one net direction through it.
+    """
+    out: list[tuple[int, float, float, int, int]] = []
+    if not path:
+        return out
+    step = CELL_SIZE / max(0.05, v_nom)
+    cur_seg, t_in, first, last = -1, t_start, None, None
+    t = t_start
+    for (cx, cy) in path:
+        if t - t_start > horizon:
+            break
+        seg = wmap.aisle_at(cx, cy)
+        if seg != cur_seg:
+            if cur_seg >= 0 and first is not None:
+                out.append((cur_seg, t_in, t,
+                            (last[0] > first[0]) - (last[0] < first[0]),
+                            (last[1] > first[1]) - (last[1] < first[1])))
+            cur_seg, t_in, first = seg, t, (cx, cy)
+        last = (cx, cy)
+        t += step
+    if cur_seg >= 0 and first is not None and last is not None:
+        out.append((cur_seg, t_in, t,
+                    (last[0] > first[0]) - (last[0] < first[0]),
+                    (last[1] > first[1]) - (last[1] < first[1])))
+    return out
+
+
+def predicted_head_on(mine: list[tuple[int, float, float, int, int]],
+                      theirs: dict[int, list[tuple[int, float, float, int, int]]],
+                      tau: float = 1.0) -> tuple[int, int, float] | None:
+    """
+    Earliest segment where a peer and I are announced to be inside together,
+    travelling OPPOSITE ways.
+
+    Returns (segment_id, peer_id, my_entry_time) or None. Same-direction
+    overlap is fine -- that is a convoy, and convoys resolve themselves.
+    """
+    best = None
+    for (seg, t0, t1, dx, dy) in mine:
+        for pid, wins in theirs.items():
+            for (pseg, pt0, pt1, pdx, pdy) in wins:
+                if pseg != seg:
+                    continue
+                if pt1 + tau < t0 or t1 + tau < pt0:
+                    continue                      # not there at the same time
+                if dx * pdx + dy * pdy >= 0:
+                    continue                      # same way, or turning
+                if best is None or t0 < best[2]:
+                    best = (seg, pid, t0)
+    return best
