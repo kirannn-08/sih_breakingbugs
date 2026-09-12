@@ -22,6 +22,38 @@ RHO = 0.9          # staleness decay per second
 TAU = 1.5          # temporal buffer, seconds
 LAMBDA_BLOCK = 50.0  # blocked-cell penalty
 
+# CLEARANCE. The reservation table matched cells EXACTLY, so two paths could
+# run two cells apart and the planner saw no cost at all -- but cells are
+# 0.50 m and the robot's circumscribed diameter is 1.40 m, so two robots two
+# cells apart on each axis are 1.41 m apart, i.e. exactly at the near-miss
+# boundary. The planner was blind to the only separation that matters.
+#
+# Occupancy is therefore smeared over a neighbourhood: a peer's claimed cell
+# still costs full, and cells near it cost a fraction that falls off with
+# distance. It is a nudge, not a wall -- a hard exclusion would make the
+# 3-cell-wide aisles unplannable, since two robots physically cannot be
+# 1.40 m apart inside a 1.50 m corridor.
+#
+# Swept over 6 seeds x 180 s. Radius 3 is the best of the four, and the gain
+# is in the aisles rather than in the headline count:
+#   radius 0   91 near misses (53 narrow / 38 open)  2 collisions  56 tasks
+#   radius 1  103              (42 / 61)             1             59
+#   radius 2   96              (31 / 65)             2             61
+#   radius 3   90              (30 / 60)             1             63
+# Narrow-aisle near misses fall 53 -> 30 and throughput rises 56 -> 63, so the
+# per-task rate goes 1.63 -> 1.43. The open-area count RISES simply because
+# more work gets done; the headline total barely moves.
+#
+# Radius 3 is NOT used despite scoring best on that sweep. It broke
+# test_congestion_changes_route: smearing 1.5 m in every direction penalises
+# every alternative route equally, so the cost landscape flattens and
+# congestion stops discriminating between paths at all. That test exists to
+# catch exactly "the congestion term is not really wired in", and it was
+# right. Radius 3 also costs 122 ms per replan against radius 2's 40 ms.
+# Radius 2 keeps the aisle benefit (53 -> 31) with the term still working.
+CLEARANCE_CELLS = 2          # 1.0 m of influence around a peer's claim
+CLEARANCE_FALLOFF = 0.45     # weight of a cell one step off the claim
+
 
 class ReservationTable:
     """Peer space-time claims, with automatic staleness decay.
@@ -54,8 +86,18 @@ class ReservationTable:
         return max(0.0, conf - 0.05 * (now - t))
 
     def occupancy(self, cx: int, cy: int, t: float, now: float,
-                  exclude: int = 0) -> float:
-        """Weighted count of peers reserving this cell near time t."""
+                  exclude: int = 0, radius: int = 0) -> float:
+        """
+        Weighted count of peers reserving this cell near time t.
+
+        `radius` > 0 also counts claims on NEARBY cells, at a weight that
+        falls off with distance. That is what lets the planner keep robots
+        apart instead of merely keeping them out of the same cell: a 0.50 m
+        cell is far smaller than a 1.40 m robot, so cell-exact avoidance
+        guarantees nothing about clearance.
+
+        radius=0 preserves the original exact-cell semantics.
+        """
         total = 0.0
         for rid, (res_list, stamp) in self._res.items():
             if rid == exclude:
@@ -64,11 +106,19 @@ class ReservationTable:
             w = RHO ** age                      # staleness decay
             if w < 0.05:
                 continue
+            best = 0.0
             for r in res_list:
-                if r.cx == cx and r.cy == cy:
-                    if not (r.t_exit + TAU < t or t + TAU < r.t_enter):
-                        total += w
-                        break
+                d = abs(r.cx - cx) + abs(r.cy - cy)
+                if d > radius:
+                    continue
+                if r.t_exit + TAU < t or t + TAU < r.t_enter:
+                    continue
+                near = w * (1.0 if d == 0 else CLEARANCE_FALLOFF ** d)
+                if near > best:
+                    best = near
+                    if d == 0:
+                        break                   # cannot do better than exact
+            total += best
         return total
 
 
@@ -170,7 +220,8 @@ def plan_st(wmap: WarehouseMap, start: tuple[int, int], goal: tuple[int, int],
             t_arrive = t_here + step_time
             cost = step_time
             if congestion_aware:
-                occ = table.occupancy(nx, ny, t_arrive, now, exclude=robot_id)
+                occ = table.occupancy(nx, ny, t_arrive, now, exclude=robot_id,
+                                      radius=CLEARANCE_CELLS)
                 worst_occ = max(worst_occ, occ)
                 cost += KAPPA * (occ ** 2)
                 cost += LAMBDA_BLOCK * table.blocked_belief(nx, ny, now)
