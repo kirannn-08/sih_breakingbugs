@@ -21,6 +21,7 @@ from amr_msgs import (BROADCAST, INF_COST, Bid, Claim, Header, Intent, MsgType,
                       Obstacle, ObstacleKind, Release, ReleaseReason, RobotMode,
                       RobotState, Task, WaitFor, make_header, wrap)
 from comms import CommsMediator
+from perception import (LIDAR_BLOCK_CONF, LidarTracker)
 from coordination import (CHARGE_RATE, OBSTACLE_CONF, SOC_LOW, SOC_RESUME,
                           T_BID, T_CLAIM, T_COOLDOWN, T_OBSTACLE, T_REBID,
                           T_RELEASE, T_WAITFOR, V_MIN,
@@ -63,6 +64,20 @@ R_HARD = ROBOT_LEN + 0.10                          # 1.10 m ahead, in-lane
 R_SLOW = ROBOT_LEN + 1.30                          # 2.30 m ahead, in-lane
 LANE_HALF_W = ROBOT_WIDTH                          # 0.98 m lateral clearance
 
+# LiDAR. Range is the same 3.0 m the simulator always used; what is new is
+# that returns are now OCCLUDED by structure and are fed to a track layer
+# that the ROUTING and DEADLOCK decisions read, not just the brake.
+LIDAR_RANGE = 3.0
+T_LIDAR_REPLAN = 2.0        # min gap between LiDAR-triggered replans
+
+# Blind-corner speed limit. Sight distance at an aisle mouth is about one
+# body length, so V_BLIND is set to what can be stopped inside it: the brake
+# resolves in one DT, and 0.30 m/s x the ~1.3 s a peer needs to emerge and
+# be tracked keeps the contact distance above D_COLLIDE.
+V_BLIND = 0.30
+D_BLIND_LOOKAHEAD = 1.5     # m of path ahead scanned for a blind corner
+T_BLIND_REACT = 1.5         # s of peer travel to treat as 'could be there'
+
 
 @dataclass
 class Metrics:
@@ -77,6 +92,13 @@ class Metrics:
     distance: float = 0.0
     replans: int = 0
     sim_time: float = 0.0
+    # -- instrumentation for the sensing/deadlock layers. Every new rule is
+    # counted so a silent no-op cannot masquerade as working code.
+    lidar_occluded: int = 0
+    lidar_blocks: int = 0
+    lidar_decisions: int = 0
+    lidar_replans: int = 0
+    blind_slowdowns: int = 0
 
     def summary(self) -> dict:
         n = max(1, len(self.task_times))
@@ -93,6 +115,11 @@ class Metrics:
             "time_stopped": round(self.time_stopped, 2),
             "distance_m": round(self.distance, 1),
             "replans": self.replans,
+            "lidar_occluded": self.lidar_occluded,
+            "lidar_blocks": self.lidar_blocks,
+            "lidar_decisions": self.lidar_decisions,
+            "lidar_replans": self.lidar_replans,
+            "blind_slowdowns": self.blind_slowdowns,
         }
 
 
@@ -153,6 +180,13 @@ class Robot:
         self.last_obstacle_bc = -1e9             # rate-limit announcements
         self.last_waitfor_bc = -1e9
         self.waitfor_target = 0                  # peer I believe blocks me
+        # -- LOCAL SENSING. Independent of comms, by construction.
+        self.lidar = LidarTracker()
+        self.last_lidar_replan = -1e9
+        self.lidar_blocks = 0        # cells marked blocked from sensing alone
+        self.lidar_decisions = 0     # speed decisions driven by sensing alone
+        self.lidar_replans = 0
+        self.blind_slowdowns = 0
         self.peer_blocked_since: dict[int, float] = {}
 
     # -- geometry ----------------------------------------------------------
@@ -736,6 +770,126 @@ class Robot:
         # Holding at the mouth is cheap; gridlock inside is not.
         return occupants >= 2
 
+    # -- decisions from LOCAL SENSING (no comms) ---------------------------
+
+    def approaching_blind_corner(self, now: float) -> bool:
+        """
+        Should I drive at sight-limited speed right now?
+
+        SENSOR AND RADIO TOGETHER. Geometry alone says every aisle mouth is
+        dangerous, which on this map is 14% of the cells but 58% of the
+        driving time -- slowing for all of them costs more throughput than
+        the collisions it prevents. Geometry says WHERE a surprise is
+        possible; the radio says whether anyone is in a position to supply
+        one; the LiDAR overrides the radio when it can already see the peer
+        the radio is warning about, because a peer in view is not hidden.
+
+        The degraded case is the important one: with no fresh peer reports at
+        all, nothing can be ruled out, so the rule reverts to slowing at every
+        mouth. Losing the radio costs speed, never safety.
+        """
+        if self.path_idx >= len(self.path):
+            return False
+        n = max(1, int(D_BLIND_LOOKAHEAD / CELL_SIZE))
+        ahead = [self.cell] + self.path[self.path_idx:self.path_idx + n]
+        corners = [c for c in ahead if self.wmap.is_blind_corner(*c)]
+        if not corners:
+            return False
+
+        fresh = [(pid, st) for pid, st in self.peers.items()
+                 if now - self.peer_seen_at.get(pid, -1e9) <= 2.0]
+        if not fresh:
+            return True                     # blackout: cannot rule anyone out
+
+        for (cx, cy) in corners:
+            wx, wy = self.wmap.to_world(cx, cy)
+            for pid, st in fresh:
+                # Where could this peer be by the time I am at the corner?
+                # Straight-line reachability at V_MAX is deliberately crude:
+                # it over-estimates, and over-estimating risk is the safe
+                # direction for a rule that can only slow me down.
+                d = math.hypot(st.x - wx, st.y - wy)
+                t_me = math.hypot(wx - self.x, wy - self.y) / V_MAX
+                if d > V_MAX * (t_me + T_BLIND_REACT):
+                    continue
+                # If I can already see it, the corner is not hiding it.
+                if any(math.hypot(tr.x - st.x, tr.y - st.y) < 0.6
+                       for tr in self.lidar.tracks if tr.confirmed(now)):
+                    continue
+                return True
+        return False
+
+    def lidar_scan(self, now: float) -> None:
+        """
+        Turn stationary LiDAR tracks on my own path into routing knowledge.
+
+        This is the comms-free half of obstacle handling. `announce_obstacle`
+        needs the wedged robot to still have a working radio and needs me to
+        receive it; this needs neither. A dead robot, a dropped pallet or a
+        person standing in the aisle all look the same to the sensor, and all
+        three should make me reroute.
+
+        Deliberately NARROW: a track is only written into the reservation
+        table if it is in my lane, ahead of me, stationary for T_STATIC, AND
+        sitting on the path I still intend to drive. Marking every stationary
+        return would blacklist every robot parked on a charging bay and
+        poison the map for the whole fleet.
+        """
+        if not self.path or self.path_idx >= len(self.path):
+            return
+        blockers = self.lidar.blocking_tracks(self.x, self.y, self.theta,
+                                              LANE_HALF_W, LIDAR_RANGE, now)
+        if not blockers:
+            return
+        ahead = set(self.path[self.path_idx:])
+        hit = False
+        for t in blockers:
+            cell = self.wmap.to_cell(t.x, t.y)
+            if cell not in ahead:
+                continue
+            self.table.mark_blocked(*cell, now, LIDAR_BLOCK_CONF)
+            self.lidar_blocks += 1
+            hit = True
+        if not hit or self.goal is None:
+            return
+        # Rate-limit: one sensor tick must not trigger a replan storm. The
+        # blockage belief persists in the table, so a suppressed replan is
+        # not a lost one -- the next scheduled replan still sees it.
+        if now - self.last_lidar_replan < T_LIDAR_REPLAN:
+            return
+        self.last_lidar_replan = now
+        if self.replan(now):
+            self.lidar_replans += 1
+
+    def lidar_speed_cap(self, now: float) -> float:
+        """
+        Speed cap derived from tracks alone. Can only ever REDUCE speed.
+
+        Resolved by whichever mechanism the arm under test uses: the full
+        system computes a slowdown, the stop-and-wait baseline halts. Putting
+        speed adaptation on both arms here would leak the mechanism under
+        test into its own control.
+        """
+        hit = self.lidar.closing_track(self.x, self.y, self.theta,
+                                       LANE_HALF_W, LIDAR_RANGE, now)
+        if hit is None:
+            return V_MAX
+        track, ttc = hit
+        if ttc > 6.0:
+            return V_MAX                      # far enough to ignore
+        self.lidar_decisions += 1
+        if not self.flags["speed_adapt"]:
+            if self.v > 0.01:
+                self.stops += 1
+            return 0.0
+        gap = max(0.05, math.hypot(track.x - self.x, track.y - self.y)
+                  - D_COLLIDE)
+        v_new, action = adapt_speed(gap, now + ttc + 1.0, now, self.v,
+                                    V_MIN, V_MAX)
+        if action == "STOP" and self.v > 0.01:
+            self.stops += 1
+        return v_new
+
     def decide_speed(self, now: float) -> float:
         """
         Speed adaptation (doc E.6). This is the mechanism that beats
@@ -747,12 +901,25 @@ class Robot:
         if self.corridor_blocked(now):
             return 0.0
 
+        # Drive within sight distance. Geometry, not comms -- it holds in a
+        # blackout, and it applies to BOTH arms because it is a sensing limit
+        # rather than the conflict-resolution mechanism under test.
+        blind_cap = V_MAX
+        if self.approaching_blind_corner(now):
+            blind_cap = V_BLIND
+            self.blind_slowdowns += 1
+
+        # LOCAL SENSING ARM. Runs first and unconditionally: it must still
+        # produce a decision when every packet is being dropped, which is the
+        # whole reason it exists. It can only lower the final command.
+        lidar_cap = min(self.lidar_speed_cap(now), blind_cap)
+
         if not self.flags["speed_adapt"]:
-            return self._stop_and_wait_speed(now)
+            return min(self._stop_and_wait_speed(now), lidar_cap)
 
         mine = sample_trajectory(self.path[self.path_idx:], now, self.v_nom)
         if not mine:
-            return self.v_nom
+            return min(self.v_nom, lidar_cap)
         others = {}
         for rid, it in self.peer_intents.items():
             if now - self.peer_seen_at.get(rid, 0) > 2.0:
@@ -763,13 +930,13 @@ class Robot:
 
         hit = first_conflict(mine, others)
         if hit is None:
-            return V_MAX if self.flags["speed_adapt"] else self.v_nom
+            return min(V_MAX, lidar_cap)
 
         t_c, pid, _, _ = hit
         my_p = self.priority(now)
         peer_p = self.peer_intents[pid].priority or [1e9]
         if tuple(my_p) < tuple(peer_p):
-            return V_MAX                    # I have right of way
+            return min(V_MAX, lidar_cap)    # right of way, still sensor-capped
 
         dist = max(0.1, (t_c - now) * self.v_nom)
         peer_exit = t_c + 1.0
@@ -777,7 +944,7 @@ class Robot:
                                     V_MIN, V_MAX)
         if action == "STOP" and self.v > 0.01:
             self.stops += 1          # count TRANSITIONS into stop, not ticks
-        return v_new
+        return min(v_new, lidar_cap)
 
     def _stop_and_wait_speed(self, now: float) -> float:
         """BASELINE B0. Full stop on any predicted conflict."""
@@ -879,10 +1046,15 @@ class Robot:
 
     def step(self, now: float, dt: float,
              sensed: list[tuple[float, float]] | None = None) -> None:
+        # Sensing updates even when parked: a robot sitting on a bay still
+        # needs to know what is around it, and its tracks must not go stale
+        # and then jump when it sets off again.
+        self.lidar.update(sensed or [], now, dt)
         if not self.path or self.path_idx >= len(self.path):
             self.v = 0.0
             return
 
+        self.lidar_scan(now)
         v_cmd = self.decide_speed(now)
         # L2 has the last word, always.
         self.v = self.safety_supervisor(v_cmd, sensed or [])
@@ -1031,9 +1203,20 @@ class Simulation:
         for r in self.robots:
             # Simulated LiDAR: geometric detection of anything within range.
             # Deliberately independent of comms -- this is local sensing.
-            sensed = [(o.x, o.y) for o in self.robots
-                      if o.id != r.id
-                      and math.hypot(o.x - r.x, o.y - r.y) < 3.0]
+            # Range AND line of sight. Without the raycast a robot detected
+            # peers straight through solid racking, so its braking was better
+            # than any real sensor could be -- yet another shortcut that
+            # biased the result favourably.
+            sensed = []
+            for o in self.robots:
+                if o.id == r.id:
+                    continue
+                if math.hypot(o.x - r.x, o.y - r.y) >= LIDAR_RANGE:
+                    continue
+                if not self.wmap.line_of_sight(r.x, r.y, o.x, o.y):
+                    self.metrics.lidar_occluded += 1
+                    continue
+                sensed.append((o.x, o.y))
             r.step(self.t, DT, sensed)
 
             # yield complete -> resume the original goal
@@ -1149,6 +1332,12 @@ class Simulation:
         self.metrics.time_stopped = sum(r.stopped_time for r in self.robots)
         self.metrics.distance = sum(r.dist for r in self.robots)
         self.metrics.replans = sum(r.replans for r in self.robots)
+        self.metrics.lidar_blocks = sum(r.lidar_blocks for r in self.robots)
+        self.metrics.lidar_decisions = sum(r.lidar_decisions
+                                           for r in self.robots)
+        self.metrics.lidar_replans = sum(r.lidar_replans for r in self.robots)
+        self.metrics.blind_slowdowns = sum(r.blind_slowdowns
+                                           for r in self.robots)
         out = self.metrics.summary()
         out["comms"] = self.comms.stats()
         return out

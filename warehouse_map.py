@@ -77,6 +77,7 @@ class WarehouseMap:
 
         self._classify_zones()
         self._segment_aisles()
+        self._mark_blind_corners()
         self._place_nodes()
 
     def _segment_aisles(self) -> None:
@@ -110,6 +111,38 @@ class WarehouseMap:
                 else:
                     seg += 1
         self.n_aisles = seg
+
+    def _mark_blind_corners(self) -> None:
+        """
+        Cells where a rack corner hides a crossing lane until you are in it.
+
+        Once LiDAR returns are occluded by structure (which they now are),
+        two robots approaching an aisle mouth on perpendicular headings are
+        invisible to each other until roughly one body length apart -- which
+        for a 1.00 m robot is already too late for a geometric brake. The
+        only sound answer is the one real AMRs and real drivers use: do not
+        travel faster than you can stop within the distance you can see.
+
+        A mouth is a free cell orthogonally adjacent to a narrow aisle
+        segment it is not itself part of. That picks out aisle entrances and
+        passing-bay notches -- 116 cells here, 14% of free space -- and NOT
+        the open cross-aisle, where sight lines are long and slowing would
+        just cost throughput for nothing.
+        """
+        self.blind_corners: set[tuple[int, int]] = set()
+        for y in range(H):
+            for x in range(W):
+                if not self.is_free(x, y):
+                    continue
+                here = self.aisle_at(x, y)
+                for nb in self.neighbors(x, y):
+                    seg = self.aisle_at(*nb)
+                    if seg >= 0 and seg != here:
+                        self.blind_corners.add((x, y))
+                        break
+
+    def is_blind_corner(self, cx: int, cy: int) -> bool:
+        return (cx, cy) in self.blind_corners
 
     def aisle_at(self, cx: int, cy: int) -> int:
         if 0 <= cx < W and 0 <= cy < H:
@@ -210,6 +243,55 @@ class WarehouseMap:
 
     def to_cell(self, x: float, y: float) -> tuple[int, int]:
         return int(x / CELL_SIZE), int(y / CELL_SIZE)
+
+    def line_of_sight(self, x0: float, y0: float,
+                      x1: float, y1: float) -> bool:
+        """
+        Is the straight segment (x0,y0)->(x1,y1) clear of structure?
+
+        World-frame metres in, boolean out. Used to reject LiDAR returns that
+        would have to pass through a rack: a sensor that sees peers through
+        solid shelving makes braking better than reality, which is the
+        favourable-bias signature this project keeps tripping over.
+
+        Amanatides-Woo grid traversal -- exact, no sampling gaps, so a rack
+        corner can never be skipped between samples.
+        """
+        cx, cy = self.to_cell(x0, y0)
+        ex, ey = self.to_cell(x1, y1)
+        dx, dy = x1 - x0, y1 - y0
+
+        step_x = 1 if dx > 0 else -1
+        step_y = 1 if dy > 0 else -1
+        # distance along the ray to the next cell boundary, per axis
+        t_max_x = t_max_y = float("inf")
+        t_dx = t_dy = float("inf")
+        if dx != 0.0:
+            bx = (cx + (1 if dx > 0 else 0)) * CELL_SIZE
+            t_max_x = (bx - x0) / dx
+            t_dx = CELL_SIZE / abs(dx)
+        if dy != 0.0:
+            by = (cy + (1 if dy > 0 else 0)) * CELL_SIZE
+            t_max_y = (by - y0) / dy
+            t_dy = CELL_SIZE / abs(dy)
+
+        # Bound the walk: a ray can cross at most this many cells.
+        budget = abs(ex - cx) + abs(ey - cy) + 2
+        while budget > 0:
+            budget -= 1
+            if (cx, cy) == (ex, ey):
+                return True
+            if t_max_x < t_max_y:
+                cx += step_x
+                t_max_x += t_dx
+            else:
+                cy += step_y
+                t_max_y += t_dy
+            if (cx, cy) == (ex, ey):
+                return True
+            if not self.is_free(cx, cy):
+                return False            # rack or wall between us
+        return True
 
     def nearest_bay(self, cx: int, cy: int) -> tuple[int, int] | None:
         if not self.passing_bays:
