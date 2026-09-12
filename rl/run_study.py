@@ -5,7 +5,7 @@ and at what fleet size? Run: python3 run_study.py
 from __future__ import annotations
 import json, time
 import numpy as np
-from env import LifelongMAPF, warehouse_grid
+from env import LifelongMAPF, sih_warehouse_grid
 from baselines import greedy_jitter, WHCAStar
 from policy import MLP
 
@@ -23,7 +23,7 @@ def run(grid, n, make_policy, seed):
     return e.throughput(), e.blocked_moves
 
 def main():
-    grid = warehouse_grid(40, 40)
+    grid = sih_warehouse_grid(tile=1)
     free = int((grid == 0).sum())
     net = MLP.load("policy_marl.npz")
 
@@ -36,10 +36,11 @@ def main():
         return f
 
     rows = []
-    print(f"grid 40x40, {free} free cells, {STEPS} steps, {SEEDS} seeds\n")
+    print(f"grid {grid.shape[1]}x{grid.shape[0]} (this warehouse), "
+          f"{free} free cells, {STEPS} steps, {SEEDS} seeds\n")
     print(f"{'N':>4}{'density':>9}{'greedy+j':>11}{'WHCA*':>9}{'learned':>9}"
           f"{'learned/WHCA*':>15}{'blocked(L)':>12}")
-    for n in (8, 16, 32, 48, 64):
+    for n in (8, 16, 32, 48, 64, 96, 128):
         res = {}
         for name, mk in (("greedy", lambda e: greedy_jitter),
                          ("whca", lambda e: WHCAStar(e)),
@@ -70,7 +71,13 @@ def main():
     print(f"\ninference: {dt*1e6:.1f} us per agent per step  "
           f"({net.n_params:,} params, numpy, single core)")
     json.dump(rows, open("results.json", "w"), indent=2)
-    print("wrote results.json")
+    import csv, os
+    os.makedirs("../results", exist_ok=True)
+    with open("../results/mapf_scaling.csv", "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+    print("wrote results.json and ../results/mapf_scaling.csv")
 
 if __name__ == "__main__":
     main()

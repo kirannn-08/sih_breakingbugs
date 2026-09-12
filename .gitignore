@@ -5,3 +5,8 @@ __pycache__/
 venv/
 *.egg-info/
 .DS_Store
+
+# Synthetic training data: 4.8 MB, fully regenerable in ~5 min with
+# `python3 synth_data.py`. The trained model (deadlock_net.npz) and the
+# result CSVs under results/ ARE committed -- they are the deliverable.
+data/

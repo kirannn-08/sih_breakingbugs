@@ -1,12 +1,25 @@
-"""Distil WHCA* into the shared local policy. Run: python3 train.py"""
+"""
+Distil WHCA* into the shared local policy.  Run: python3 train.py
+
+Trained on THIS warehouse (`sih_warehouse_grid`), not the generic 40x40 rack
+grid it used to use. The generic grid has different aisle widths, no passing
+bays and no blind corners, so a policy distilled on it was learning another
+building's traffic -- which is exactly the complaint that motivated this
+change.
+
+Trained at the SAME density run_study.py evaluates at (tile=1). Training on
+a 2x2 tiling and evaluating on the single map cost ~6 points of held-out
+agreement and inflated blocked moves tenfold at N=8, which is a train/serve
+mismatch and not a property of the policy.
+"""
 from __future__ import annotations
 import time
 import numpy as np
-from env import LifelongMAPF, warehouse_grid
+from env import LifelongMAPF, sih_warehouse_grid
 from policy import MLP, collect
 
 def main(seed=0):
-    grid = warehouse_grid(40, 40)
+    grid = sih_warehouse_grid(tile=1)
     t0 = time.time()
     print("collecting expert demonstrations (WHCA*, mixed densities) ...")
     Xs, Ys = [], []

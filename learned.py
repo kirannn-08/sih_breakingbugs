@@ -39,6 +39,8 @@ No learned component sits below layer L4.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 WINDOW = 7                      # local observation window (odd)
@@ -234,3 +236,87 @@ class HybridCoordinator:
         return {"policy_used": self.n_policy_used,
                 "fallback": self.n_fallback,
                 "policy_pct": round(100 * self.n_policy_used / max(1, tot), 1)}
+
+
+# ==========================================================================
+# Deadlock-risk predictor  (trained by train_deadlock.py)
+# ==========================================================================
+
+class DeadlockRiskModel:
+    """
+    P(this robot is wedged within ~10 s), from its own local observation.
+
+    WHERE IT SITS
+    -------------
+    L4 advisory, and nothing below it. It can cause a robot to WAIT at the
+    mouth of a corridor it was about to enter. It cannot command a velocity,
+    cannot raise a speed, cannot override the safety supervisor, and has no
+    say in deadlock RESOLUTION -- that stays deterministic LIFO, because a
+    learned component that resolves deadlocks sometimes is worse than a rule
+    that resolves them always.
+
+    So the failure mode of this model is a robot that waits when it did not
+    need to: throughput, never safety.
+
+    CONFIDENCE BAND
+    ---------------
+    The model only overrides the rule when it is confident. Between
+    LOW_CONF and HIGH_CONF the deterministic rule decides alone, which is the
+    same fallback discipline `HybridCoordinator` uses for the action policy.
+    Held-out skill in the regime this actually runs in -- a MOVING robot, the
+    only one that can still act -- is AUC 0.839, not the 0.975 of the full
+    evaluation set, which is inflated by robots already stalled.
+    """
+
+    # Calibrated by sweeping it in the closed loop, not picked by eye. The
+    # model is only allowed to overrule the deterministic rule where it is
+    # nearly certain, because measured over 10 seeds x 180 s the cost of a
+    # false deferral is steep and the benefit of a true one is small:
+    #
+    #    threshold   tasks completed   avg task time
+    #    rule only        60               33.36 s
+    #    0.80             54               32.26 s
+    #    0.90             57               33.29 s
+    #    0.95             59               33.89 s
+    #    0.99             62               34.56 s
+    #
+    # At 0.99 it is a wash -- +2 tasks out of 60 is inside seed noise -- and
+    # everywhere below that it is a clear loss. See DEADLOCK_RESOLUTION.md:
+    # the model has genuine offline skill (AUC 0.839 on moving robots) and
+    # does NOT convert it into throughput in the loop. It is therefore
+    # OFF BY DEFAULT and this is reported rather than tuned away.
+    HIGH_CONF = 0.99        # above this, defer even if the rule says go
+    LOW_CONF = 0.20         # below this, proceed even if the rule is unsure
+
+    def __init__(self, path: str = "deadlock_net.npz"):
+        d = np.load(path, allow_pickle=True)
+        self.net = PolicyNet(obs_dim=int(d["W1"].shape[0]), h1=64, h2=32,
+                             n_out=2)
+        self.net.W1, self.net.b1 = d["W1"], d["b1"]
+        self.net.W2, self.net.b2 = d["W2"], d["b2"]
+        self.net.W3, self.net.b3 = d["W3"], d["b3"]
+        # Normalisation travels WITH the weights. A model normalised with
+        # statistics the robot cannot reproduce silently does something else
+        # in the field than it did on the bench.
+        self.mu, self.sd = d["mu"], d["sd"]
+        self.n_calls = 0
+        self.n_high = 0
+        self.n_low = 0
+
+    @staticmethod
+    def available(path: str = "deadlock_net.npz") -> bool:
+        return os.path.exists(path)
+
+    def risk(self, feat: np.ndarray) -> float:
+        x = ((feat - self.mu) / self.sd).reshape(1, -1).astype(np.float32)
+        p = float(self.net.forward(x)[0][0, 1])
+        self.n_calls += 1
+        if p >= self.HIGH_CONF:
+            self.n_high += 1
+        elif p <= self.LOW_CONF:
+            self.n_low += 1
+        return p
+
+    def stats(self) -> dict:
+        return {"calls": self.n_calls, "high_risk": self.n_high,
+                "low_risk": self.n_low}

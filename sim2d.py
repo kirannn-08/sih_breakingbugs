@@ -21,6 +21,8 @@ from amr_msgs import (BROADCAST, INF_COST, Bid, Claim, Header, Intent, MsgType,
                       Obstacle, ObstacleKind, Release, ReleaseReason, RobotMode,
                       RobotState, Task, WaitFor, make_header, wrap)
 from comms import CommsMediator
+from features import deadlock_features
+from learned import DeadlockRiskModel
 from perception import (LIDAR_BLOCK_CONF, LidarTracker)
 from coordination import (CHARGE_RATE, OBSTACLE_CONF, SOC_LOW, SOC_RESUME,
                           T_BACKOUT, T_BID, T_CLAIM, T_COOLDOWN, T_OBSTACLE,
@@ -106,6 +108,7 @@ class Metrics:
     entry_deferrals: int = 0
     planned_waits: int = 0
     waits_executed: int = 0
+    risk_deferrals: int = 0
     collision_ticks: int = 0
     near_miss_ticks: int = 0
 
@@ -136,6 +139,7 @@ class Metrics:
             "entry_deferrals": self.entry_deferrals,
             "planned_waits": self.planned_waits,
             "waits_executed": self.waits_executed,
+            "risk_deferrals": self.risk_deferrals,
             "avg_recovery_s": round(
                 sum(self.deadlock_recovery_s)
                 / max(1, len(self.deadlock_recovery_s)), 2),
@@ -226,6 +230,7 @@ class Robot:
         self.path_holds: list[float] = []
         self.planned_waits = 0        # holds the planner asked for
         self.waits_executed = 0       # ticks actually spent honouring one
+        self.risk_deferrals = 0       # deferrals the MODEL caused, not the rule
 
     # -- geometry ----------------------------------------------------------
 
@@ -572,6 +577,8 @@ class Robot:
         4589 robot-ticks. The last robot in is the one nearest the entrance,
         and the stretch behind it is the stretch it has just driven.
         """
+        if not self.flags.get("lifo", True):
+            return False            # B5 ablation: no stack, no backout
         if self.backing_out or self.yielding or self.stall_since is None:
             return False
         if now - self.stall_since < T_OBSTACLE:
@@ -1119,13 +1126,34 @@ class Robot:
                 [tuple(c) for c in it.path_cells], now,
                 max(0.05, it.nominal_speed), self.wmap)
         hit = predicted_head_on(mine, theirs)
+        model = self.flags.get("risk")
         if hit is None:
+            # The rule sees nothing. Ask the model whether it sees something
+            # the rule's opposed-heading test cannot: that test needs a peer
+            # to be MOVING towards me, and in a forming jam everyone has
+            # already slowed down. The hand-written baseline scores recall
+            # 0.001 for exactly this reason.
+            if model is not None:
+                p = model.risk(deadlock_features(self, now))
+                if p >= model.HIGH_CONF:
+                    self.risk_deferrals += 1
+                    self.entry_deferrals += 1
+                    return True
             return False
         seg_id, pid, my_entry = hit
         their_entry = min((w[1] for w in theirs[pid] if w[0] == seg_id),
                           default=1e9)
         if my_entry < their_entry - SEG_TIE:
-            return False                      # I get there first, go
+            # I get there first -- unless the model is confident this is a
+            # jam. Overriding only in the CAUTIOUS direction is what keeps
+            # this safe: a wrong model costs a wait, never a collision.
+            if model is not None:
+                p = model.risk(deadlock_features(self, now))
+                if p >= model.HIGH_CONF:
+                    self.risk_deferrals += 1
+                    self.entry_deferrals += 1
+                    return True
+            return False
         if abs(my_entry - their_entry) <= SEG_TIE:
             peer_p = self.peer_intents[pid].priority or [1e9]
             if tuple(self.priority(now)) < tuple(peer_p):
@@ -1361,14 +1389,22 @@ class Robot:
 class Simulation:
     def __init__(self, n_robots: int = 4, seed: int = 0,
                  congestion: bool = True, speed_adapt: bool = True,
-                 loss_rate: float = 0.0, use_policy: bool = False):
+                 loss_rate: float = 0.0, use_policy: bool = False,
+                 use_risk_model: bool = False, lifo_stack: bool = True):
         self.rng = random.Random(seed)
         self.wmap = WarehouseMap()
         ids = list(range(1, n_robots + 1))
         self.comms = CommsMediator(ids, random.Random(seed),
                                    loss_rate=loss_rate)
+        # `use_policy` selects the ACTION policy and is still unread --
+        # DEAD_CODE.md Tier 3, unchanged by this work and still honest.
+        # `use_risk_model` is the deadlock-risk predictor and IS consumed,
+        # in Robot.segment_entry_deferred.
+        risk = None
+        if use_risk_model and DeadlockRiskModel.available():
+            risk = DeadlockRiskModel()
         flags = {"congestion": congestion, "speed_adapt": speed_adapt,
-                 "policy": use_policy}
+                 "policy": use_policy, "risk": risk, "lifo": lifo_stack}
 
         # AMRs begin on charging bays, not scattered mid-aisle. A robot that
         # starts stray is already obstructing a corridor at t=0, which biases
@@ -1660,6 +1696,8 @@ class Simulation:
                                            for r in self.robots)
         self.metrics.planned_waits = sum(r.planned_waits for r in self.robots)
         self.metrics.waits_executed = sum(r.waits_executed
+                                          for r in self.robots)
+        self.metrics.risk_deferrals = sum(r.risk_deferrals
                                           for r in self.robots)
         out = self.metrics.summary()
         out["comms"] = self.comms.stats()

@@ -28,6 +28,40 @@ ACTIONS = np.array([[0, 0], [0, -1], [0, 1], [-1, 0], [1, 0]], dtype=np.int32)
 N_ACTIONS = len(ACTIONS)
 
 
+def sih_warehouse_grid(tile: int = 1) -> np.ndarray:
+    """
+    THE ACTUAL MAP the fleet runs on, as a MAPF grid. 1 = blocked.
+
+    The generic `warehouse_grid` below shares no geometry with the warehouse
+    this system has to work in: different aisle widths, no passing-bay
+    notches, no blind corners at the aisle mouths, no charging bays, and a
+    task distribution that does not funnel traffic through one cross-aisle.
+    A scaling study run on it measures a different building, so its numbers
+    cannot be carried over to this one -- and the policy trained on it was
+    learning another warehouse's traffic.
+
+    `tile` replicates the map in both axes so the >32-agent end of the
+    curriculum has somewhere to put the agents. The real map has 804 free
+    cells, and 64 agents on 804 cells is a density no warehouse operates at.
+    Tiling keeps the LOCAL geometry -- aisle width, mouth spacing, rack
+    pitch -- which is what the policy actually observes, while giving the
+    fleet room.
+    """
+    import os
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from warehouse_map import FREE, WarehouseMap
+
+    m = WarehouseMap()
+    base = np.array([[0 if m.grid[y][x] == FREE else 1 for x in range(m.w)]
+                     for y in range(m.h)], dtype=np.int8)
+    if tile > 1:
+        base = np.tile(base, (tile, tile))
+    # The perimeter must stay drivable or the tiles are disconnected islands.
+    base[0, :] = base[-1, :] = base[:, 0] = base[:, -1] = 0
+    return base
+
+
 def warehouse_grid(w: int = 40, h: int = 40, rack_w: int = 2, rack_h: int = 6,
                    aisle: int = 2) -> np.ndarray:
     """Regular rack layout. 1 = blocked. Border is always free (perimeter loop)."""
