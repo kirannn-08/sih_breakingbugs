@@ -30,7 +30,7 @@ from coordination import (CHARGE_RATE, OBSTACLE_CONF, SOC_LOW, SOC_RESUME,
                           DeadlockDetector, adapt_speed, bid_cost,
                           conflict_risk, feasible, first_conflict, has_quorum,
                           make_priority, predicted_head_on, resolve_auction,
-                          sample_trajectory, segment_windows)
+                          sample_trajectory, segment_windows, T_YIELD_CONFIRM)
 from planner import (ReservationTable, congestion_cost, path_length_m, plan,
                      path_to_reservations, plan_st, schedule_of)
 from warehouse_map import CELL_SIZE, WarehouseMap
@@ -81,6 +81,7 @@ V_BLIND = 0.30
 D_BLIND_LOOKAHEAD = 1.5     # m of path ahead scanned for a blind corner
 T_BLIND_REACT = 1.5         # s of peer travel to treat as 'could be there'
 SEG_TIE = 0.5               # entry times within this are a dead heat
+MIN_BACKOUT_CELLS = 1       # a one-cell retreat still breaks a mutual stop
 
 
 @dataclass
@@ -109,6 +110,7 @@ class Metrics:
     planned_waits: int = 0
     waits_executed: int = 0
     risk_deferrals: int = 0
+    yield_skips: int = 0
     collision_ticks: int = 0
     near_miss_ticks: int = 0
 
@@ -140,6 +142,7 @@ class Metrics:
             "planned_waits": self.planned_waits,
             "waits_executed": self.waits_executed,
             "risk_deferrals": self.risk_deferrals,
+            "yield_skips": self.yield_skips,
             "avg_recovery_s": round(
                 sum(self.deadlock_recovery_s)
                 / max(1, len(self.deadlock_recovery_s)), 2),
@@ -224,6 +227,11 @@ class Robot:
         self.backout_deadline = 0.0
         self.peer_entered_at: dict[int, float] = {}
         self.peer_dist_to_block: dict[int, float] = {}
+        self.peer_backing_out: dict[int, bool] = {}
+        # when I first computed peer X as the elected yielder. Used to time
+        # out a candidate that never confirms it is backing out.
+        self.yield_elect_since: dict[int, float] = {}
+        self.yield_skips = 0
         self.backouts = 0
         self.backouts_done = 0
         self.entry_deferrals = 0
@@ -314,6 +322,7 @@ class Robot:
                 self.peer_entered_at[pkt.src] = float(p.get("entered_at", 0.0))
                 self.peer_dist_to_block[pkt.src] = float(
                     p.get("dist_to_block", 0.0)) or 1e9
+                self.peer_backing_out[pkt.src] = bool(p.get("backing_out", False))
         return tasks
 
     def check_degraded(self, now: float) -> None:
@@ -535,17 +544,39 @@ class Robot:
         if now - self.last_waitfor_bc < T_WAITFOR:
             return
         self.last_waitfor_bc = now
+        # WHO IS BLOCKING ME = whoever the SAFETY SUPERVISOR is braking for.
+        #
+        # This used to test whether a peer was "ahead" by dotting (peer - me)
+        # against (next waypoint - me). That is not the question the brake
+        # asks, and at an intersection the two disagree: a peer stopping me
+        # from a perpendicular bearing fails the dot product, so a robot that
+        # was hard-stopped broadcast `waiting_for = 0` -- "nobody is blocking
+        # me" -- while standing still because of that exact peer.
+        #
+        # Wait-for edges are the ONLY input to cycle detection, so a missing
+        # edge is a missing cycle. Measured: NO_CYCLE on 1500 of 1500 ticks
+        # with all four robots frozen, edges {3->2, 1->4}, a chain that can
+        # never close. The whole LIFO stack was unreachable -- not broken,
+        # never invoked.
+        #
+        # Now it uses the supervisor's own body-frame lane test, so if a peer
+        # is the reason I am stopped, that peer is the one I name.
         blocker = 0
         if self.stall_since is not None and self.path_idx < len(self.path):
-            tx, ty = self.wmap.to_world(*self.path[self.path_idx])
+            hx, hy = math.cos(self.theta), math.sin(self.theta)
             best_d = 1e9
             for pid, st in self.peers.items():
                 if now - self.peer_seen_at.get(pid, -1e9) > 2.0:
                     continue
-                d = math.hypot(st.x - self.x, st.y - self.y)
-                ahead = ((st.x - self.x) * (tx - self.x)
-                         + (st.y - self.y) * (ty - self.y)) > 0
-                if ahead and d < 3.0 and d < best_d:
+                dx, dy = st.x - self.x, st.y - self.y
+                d = math.hypot(dx, dy)
+                fwd = dx * hx + dy * hy
+                lat = -dx * hy + dy * hx
+                in_lane = (fwd > 0.0 and abs(lat) < LANE_HALF_W
+                           and fwd < R_SLOW)
+                # Body contact counts whatever the bearing -- that is what the
+                # omnidirectional floor brakes for.
+                if (in_lane or d < D_NEAR) and d < best_d:
                     best_d, blocker = d, pid
         self.waitfor_target = blocker
         self.deadlock.set_edge(self.id, blocker)
@@ -585,6 +616,7 @@ class Robot:
             return False
         cycle = self.deadlock.find_cycle()
         if not cycle:
+            self.yield_elect_since.clear()
             return False
         # The stack is the cycle plus everyone queued behind it: resolving a
         # jam means moving whoever is physically in the way, and that robot is
@@ -602,11 +634,41 @@ class Robot:
         dists = dict(self.peer_dist_to_block)
         dists[self.id] = self.dist_to_blocker(now)
 
-        if DeadlockDetector.choose_yielder_lifo(
-                stack, entered, dists, prios) != self.id:
-            return False            # someone else pops; hold position
+        # Walk the stack in pop order and take the first candidate that has
+        # not already failed to move. Election is not ability: the top of the
+        # stack may have a peer parked in its reverse path and no route out.
+        # A single-candidate election has no fallback, and an elected robot
+        # that cannot move freezes the whole fleet -- measured at 300 s of
+        # total paralysis with the cycle correctly detected the whole time.
+        #
+        # A candidate is skipped once it has been elected for longer than
+        # T_YIELD_CONFIRM without its broadcast `backing_out` flag going true.
+        # That flag is already on the air, so every robot reaches the same
+        # conclusion from the same evidence and the election stays
+        # decentralised.
+        order = DeadlockDetector.rank_yielders_lifo(stack, entered, dists,
+                                                    prios)
+        chosen = 0
+        for cand in order:
+            self.yield_elect_since.setdefault(cand, now)
+            confirmed = (self.backing_out if cand == self.id
+                         else self.peer_backing_out.get(cand, False))
+            if confirmed:
+                return False          # it is already moving; leave it alone
+            if now - self.yield_elect_since[cand] > T_YIELD_CONFIRM:
+                self.yield_skips += 1
+                continue              # elected, never moved -> next one down
+            chosen = cand
+            break
+        if chosen != self.id:
+            return False              # someone else pops; hold position
 
-        return self.start_backout(now)
+        if self.start_backout(now):
+            return True
+        # I cannot move either. Mark myself as having had my turn so the
+        # fleet stops waiting on me, rather than re-electing me every tick.
+        self.yield_elect_since[self.id] = now - T_YIELD_CONFIRM - 1e-3
+        return False
 
     def dist_to_waypoint(self) -> float:
         if self.path_idx >= len(self.path):
@@ -645,7 +707,12 @@ class Robot:
             route.append(cell)
             if not self.wmap.is_narrow(*cell):
                 return route               # wide enough to be passed here
-        return None                        # no passing point behind me
+        # Trail exhausted with no passing point. Retreat anyway if there is
+        # anywhere at all to go: demanding a perfect passing bay or nothing
+        # returned None for every candidate in the stack and froze the fleet.
+        # Backing off even one cell breaks the symmetry of a mutual hard stop,
+        # which is the thing that actually has to happen.
+        return route if len(route) >= MIN_BACKOUT_CELLS else None
 
     def start_backout(self, now: float) -> bool:
         route = self.backout_target(now)
@@ -667,7 +734,12 @@ class Robot:
         self.saved_goal = None
         self.blocked_since = 0.0
         self.stall_since = None
-        self.trail = [self.cell]
+        # Do NOT wipe the trail. It used to reset to [self.cell] here, which
+        # destroys the only escape route the robot has: a robot that finishes
+        # one backout and re-jams a second later then has trail_len == 1,
+        # `backout_target` returns None forever, and it can never yield again.
+        # Measured: R2 frozen 300 s with a one-cell trail. The trail is capped
+        # at 60 cells anyway, so keeping it costs nothing.
         if self.goal:
             self.replan(now)
 
@@ -1300,7 +1372,8 @@ class Robot:
         return nx / n, ny / n
 
     def safety_supervisor(self, v_cmd: float,
-                          sensed: list[tuple[float, float]]) -> float:
+                          sensed: list[tuple[float, float]],
+                          reverse: bool = False) -> float:
         """
         L2. Deterministic geometric brake. FINAL AUTHORITY over speed.
 
@@ -1312,7 +1385,13 @@ class Robot:
             stays collision-free in degraded mode.
         """
         v_out = v_cmd
-        hx, hy = math.cos(self.theta), math.sin(self.theta)
+        # Travel direction, which is NOT the same as heading when reversing.
+        # The brake must watch the end of the robot that is moving first --
+        # checking the front lane while backing up is how you reverse into
+        # somebody at full speed.
+        sgn = -1.0 if reverse else 1.0
+        hx = math.cos(self.theta) * sgn
+        hy = math.sin(self.theta) * sgn
         for (px, py) in sensed:
             dx, dy = px - self.x, py - self.y
             d = math.hypot(dx, dy)
@@ -1350,7 +1429,7 @@ class Robot:
         self.lidar_scan(now)
         v_cmd = self.decide_speed(now)
         # L2 has the last word, always.
-        self.v = self.safety_supervisor(v_cmd, sensed or [])
+        self.v = self.safety_supervisor(v_cmd, sensed or [], self.backing_out)
         # Measure my own stall. Do not wait to be told by a central observer.
         if self.v < 0.05:
             if self.stall_since is None:
@@ -1380,7 +1459,15 @@ class Robot:
                 self.stopped_time += dt
                 return
 
-        self.theta = math.atan2(ny - self.y, nx - self.x)
+        # REVERSING. A backout drives the trail backwards without turning
+        # round, because a 0.98 m body cannot turn in a 1.50 m aisle and
+        # swinging it would sweep through the very peer it is escaping. Real
+        # AMRs reverse out of exactly this situation, and holding the heading
+        # is also what frees the robot: the peer that hard-stopped it is now
+        # BEHIND the direction of travel, so the front lane is clear and the
+        # supervisor stops vetoing the move.
+        if not self.backing_out:
+            self.theta = math.atan2(ny - self.y, nx - self.x)
         self.dist += math.hypot(nx - self.x, ny - self.y)
         self.x, self.y = nx, ny
         self.battery = max(0.0, self.battery - move * 0.0008)
@@ -1543,16 +1630,31 @@ class Simulation:
                 d = math.hypot(o.x - r.x, o.y - r.y)
                 if d >= LIDAR_RANGE:
                     continue
-                # Occlusion is a LONG-RANGE optical property. At contact range
-                # it is not physical: a rack corner cannot hide a 0.98 m wide
-                # body whose centre is 0.97 m from yours -- the two footprints
-                # are already overlapping, and a real AMR's bumper and
-                # proximity ring do not care what the scanner can see.
+                # Occlusion is a LONG-RANGE optical property. At CONTACT
+                # range it is not physical: a rack corner cannot hide a 0.98 m
+                # wide body whose centre is 0.97 m from yours -- the two
+                # footprints already overlap, and a real AMR's bumper does not
+                # care what the scanner can see. Without the exemption two
+                # robots grazed at 0.974 m with the supervisor never firing
+                # (1359 contact ticks, seed 5).
                 #
-                # Without this exemption two robots could sit diagonally
-                # across a rack corner, mutually invisible, and graze at
-                # 0.974 m with the supervisor never firing. Measured on
-                # seed 5: 1359 contact ticks from exactly that geometry.
+                # The threshold is D_NEAR: the swept circles of two 0.70 m
+                # radius bodies touch there, so anything closer is a genuine
+                # proximity event that a bumper ring would register.
+                #
+                # This DOES create mutual hard stops -- an occluded peer
+                # between R_HARD (1.10 m) and D_NEAR triggers a brake that
+                # the supervisor cannot lift, because it may only reduce
+                # speed. Narrowing the threshold to D_COLLIDE to dodge that
+                # was the wrong trade: it bought 0 deadlock-freezes at the
+                # price of 3 collisions over 10 seeds, and a collision is not
+                # a currency this project spends.
+                #
+                # Breaking a mutual stop is the DEADLOCK layer's job, not the
+                # brake's, and it can now actually do it: cycles are detected
+                # (the wait-for edge names whoever the brake is stopping for),
+                # the election falls through to a candidate that can move, and
+                # the yielder REVERSES out without turning round.
                 if d >= D_NEAR and not self.wmap.line_of_sight(
                         r.x, r.y, o.x, o.y):
                     self.metrics.lidar_occluded += 1
@@ -1646,6 +1748,7 @@ class Simulation:
         m.planned_waits = sum(r.planned_waits for r in rs)
         m.waits_executed = sum(r.waits_executed for r in rs)
         m.risk_deferrals = sum(r.risk_deferrals for r in rs)
+        m.yield_skips = sum(r.yield_skips for r in rs)
 
     def resolve_deadlocks(self) -> None:
         """

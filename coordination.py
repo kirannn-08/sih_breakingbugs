@@ -80,6 +80,14 @@ V_STALL = 0.05
 # arrivals, so a robot cannot be chosen to yield forever.
 T_BACKOUT = 20.0     # give up on a backout that has not cleared in this long
 LIFO_EPS = 0.25      # entry stamps within this are a tie -> distance decides
+# How long the fleet waits for an elected robot to confirm it is backing out
+# before electing the next one down the stack. Election is not the same thing
+# as ABILITY: the top of the stack may have a peer parked in its reverse path
+# and no route out. Without this the election has one candidate and no
+# fallback, so an elected robot that cannot move freezes the whole fleet --
+# measured at 300 s of total paralysis. Confirmation is observable because
+# WaitFor.backing_out is broadcast.
+T_YIELD_CONFIRM = 3.0
 
 # predictive segment reservation
 SEG_HORIZON = 14.0   # s of announced path scanned for segment traversals
@@ -327,6 +335,29 @@ class DeadlockDetector:
                     members.add(waiter)
                     changed = True
         return sorted(members)
+
+    @staticmethod
+    def rank_yielders_lifo(cycle: list[int],
+                           entered_at: dict[int, float],
+                           dist_to_block: dict[int, float],
+                           priorities: dict[int, list[float]]) -> list[int]:
+        """
+        The whole stack in pop order, latest entrant first.
+
+        Returning the full ranking rather than just the winner is what makes a
+        FALLBACK possible. Being elected and being able to move are different
+        things: the top of the stack may have a peer standing in its reverse
+        path. With a single-candidate election there is nobody to fall back
+        to, and the fleet waits forever on a robot that cannot go anywhere.
+        """
+        if not cycle:
+            return []
+        return sorted(
+            cycle,
+            key=lambda r: (-entered_at.get(r, 0.0),
+                           dist_to_block.get(r, 1e9),
+                           [-v for v in priorities.get(r, [-1e9])],
+                           -r))
 
     @staticmethod
     def choose_yielder_lifo(cycle: list[int],
