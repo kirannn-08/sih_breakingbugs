@@ -1609,6 +1609,43 @@ class Simulation:
                     r.go_idle(self.t)
 
         self.check_collisions()
+        self.aggregate_metrics()
+
+    def aggregate_metrics(self) -> None:
+        """
+        Roll per-robot counters up into Metrics.
+
+        Called from `step`, NOT only from `run`. It used to live at the end of
+        `run` alone, which meant every per-robot counter read ZERO for any
+        consumer that drives `step` directly -- and the dashboard is exactly
+        such a consumer. The live UI reported `deadlocks 4, backouts 0/0`,
+        which is not a state this code can reach: `deadlocks` only increments
+        when a backout starts. That impossible pair is what exposed it.
+
+        `replans`, `full_stops`, `time_stopped` and `distance_m` had the same
+        defect before any of the new counters existed, so the dashboard has
+        been showing zeros for those since it was written.
+
+        Cost is a dozen sums over 4 robots per 0.1 s tick. Immeasurable next
+        to the planner, and the alternative is a metric that is silently dead
+        in the one view a human actually looks at.
+        """
+        m, rs = self.metrics, self.robots
+        m.sim_time = self.t
+        m.full_stops = sum(r.stops for r in rs)
+        m.time_stopped = sum(r.stopped_time for r in rs)
+        m.distance = sum(r.dist for r in rs)
+        m.replans = sum(r.replans for r in rs)
+        m.lidar_blocks = sum(r.lidar_blocks for r in rs)
+        m.lidar_decisions = sum(r.lidar_decisions for r in rs)
+        m.lidar_replans = sum(r.lidar_replans for r in rs)
+        m.blind_slowdowns = sum(r.blind_slowdowns for r in rs)
+        m.backouts = sum(r.backouts for r in rs)
+        m.backouts_done = sum(r.backouts_done for r in rs)
+        m.entry_deferrals = sum(r.entry_deferrals for r in rs)
+        m.planned_waits = sum(r.planned_waits for r in rs)
+        m.waits_executed = sum(r.waits_executed for r in rs)
+        m.risk_deferrals = sum(r.risk_deferrals for r in rs)
 
     def resolve_deadlocks(self) -> None:
         """
@@ -1679,26 +1716,7 @@ class Simulation:
                     and not self.open_tasks):
                 break
 
-        self.metrics.sim_time = self.t
-        self.metrics.full_stops = sum(r.stops for r in self.robots)
-        self.metrics.time_stopped = sum(r.stopped_time for r in self.robots)
-        self.metrics.distance = sum(r.dist for r in self.robots)
-        self.metrics.replans = sum(r.replans for r in self.robots)
-        self.metrics.lidar_blocks = sum(r.lidar_blocks for r in self.robots)
-        self.metrics.lidar_decisions = sum(r.lidar_decisions
-                                           for r in self.robots)
-        self.metrics.lidar_replans = sum(r.lidar_replans for r in self.robots)
-        self.metrics.blind_slowdowns = sum(r.blind_slowdowns
-                                           for r in self.robots)
-        self.metrics.backouts = sum(r.backouts for r in self.robots)
-        self.metrics.backouts_done = sum(r.backouts_done for r in self.robots)
-        self.metrics.entry_deferrals = sum(r.entry_deferrals
-                                           for r in self.robots)
-        self.metrics.planned_waits = sum(r.planned_waits for r in self.robots)
-        self.metrics.waits_executed = sum(r.waits_executed
-                                          for r in self.robots)
-        self.metrics.risk_deferrals = sum(r.risk_deferrals
-                                          for r in self.robots)
+        self.aggregate_metrics()
         out = self.metrics.summary()
         out["comms"] = self.comms.stats()
         return out
