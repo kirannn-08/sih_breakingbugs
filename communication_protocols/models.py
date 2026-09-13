@@ -2,10 +2,10 @@ import json
 from dataclasses import dataclass, field
 import time
 
-BROADCAST = -1
+MESH_BROADCAST = -1
 
 @dataclass
-class LinkPacket:
+class MeshPacket:
     message_id: str
     origin_id: int
     forwarder_id: int

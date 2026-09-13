@@ -1,9 +1,9 @@
 import random
 import asyncio
 import math
-from network import CommsMediator, DeadZone
+from network import RadioMedium, RFDeadZone
 from amr_node import TelemetryExtractor, AMRCommNode
-from models import LinkPacket
+from models import MeshPacket
 
 class SimulationController:
     def __init__(self, num_amrs=5, on_event=None):
@@ -23,11 +23,11 @@ class SimulationController:
                 
         rng = random.Random(42)
         # Using a much larger comm range to match pixel scale (e.g. 300 pixels)
-        self.wifi_net = CommsMediator(self.all_nodes, rng, comm_range=300.0, loss_rate=0.01, latency_mean=0.010, name="WIFI", on_event=self._dispatch_event)
-        self.wisun_net = CommsMediator(self.all_nodes, rng, comm_range=400.0, loss_rate=0.05, latency_mean=0.080, name="WISUN", on_event=self._dispatch_event)
+        self.wifi_net = RadioMedium(self.all_nodes, rng, comm_range=300.0, loss_rate=0.01, latency_mean=0.010, name="WIFI", on_event=self._dispatch_event)
+        self.wisun_net = RadioMedium(self.all_nodes, rng, comm_range=400.0, loss_rate=0.05, latency_mean=0.080, name="WISUN", on_event=self._dispatch_event)
         
         # Deadzone in pixel coordinates
-        self.dz = DeadZone(x0=300, y0=200, x1=700, y1=500)
+        self.dz = RFDeadZone(x0=300, y0=200, x1=700, y1=500)
         self.wifi_net.dead_zones.append(self.dz)
         
         self.extractors = {r_id: TelemetryExtractor(r_id) for r_id in self.robot_ids}

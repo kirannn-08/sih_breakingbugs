@@ -30,14 +30,14 @@ except ImportError:
 # ==========================================
 # 1. MESSAGE DEFINITIONS
 # ==========================================
-BROADCAST: int = -1
+MESH_BROADCAST: int = -1
 
 @dataclass
-class LinkPacket:
+class MeshPacket:
     msg_id: str             # Unique message identifier
     src: int                # Permanent Origin AMR ID
     forwarder: int          # ID of node transmitting this hop
-    dst: int                # Target AMR ID or BROADCAST (-1)
+    dst: int                # Target AMR ID or MESH_BROADCAST (-1)
     ttl: int                # Time-To-Live (hop count)
     msg_type: str           # 'TELEMETRY', 'TASK_ASSIGNMENT', 'TELEMETRY_RELAY'
     priority: int           # Priority flag (1 = High, 5 = Low)
@@ -62,7 +62,7 @@ class LinkPacket:
 # ==========================================
 # 2. NETWORK SIMULATOR (PHYSICS ENGINE)
 # ==========================================
-class DeadZone:
+class RFDeadZone:
     def __init__(self, x0, y0, x1, y1, deliver_prob=0.0):
         self.bounds = (x0, y0, x1, y1)
         self.prob = deliver_prob
@@ -71,7 +71,7 @@ class DeadZone:
         x0, y0, x1, y1 = self.bounds
         return x0 <= x <= x1 and y0 <= y <= y1
 
-class CommsMediator:
+class RadioMedium:
     """Mock Network Physics Engine for Multi-AMR Fleet Simulation"""
     def __init__(self, robot_ids, rng, comm_range, loss_rate=0.0, latency_mean=0.0, name="NET"):
         self.name = name
@@ -112,8 +112,8 @@ class CommsMediator:
             if r_id == pkt.forwarder:
                 continue
             
-            # If unicast/directed packet (not BROADCAST), skip non-destination nodes
-            if pkt.dst != BROADCAST and pkt.dst != r_id:
+            # If unicast/directed packet (not MESH_BROADCAST), skip non-destination nodes
+            if pkt.dst != MESH_BROADCAST and pkt.dst != r_id:
                 continue
             
             # Dead zone blocking: If receiver is inside dead zone on this medium
@@ -242,7 +242,7 @@ class TelemetryExtractorNode(Node):
 # 4. AMR COMMUNICATIONS MESH NODE
 # ==========================================
 class AMRCommNode:
-    def __init__(self, robot_id: int, wifi_net: CommsMediator, wisun_net: CommsMediator, all_ids: list[int]):
+    def __init__(self, robot_id: int, wifi_net: RadioMedium, wisun_net: RadioMedium, all_ids: list[int]):
         self.robot_id = robot_id
         self.wifi_net = wifi_net
         self.wisun_net = wisun_net
@@ -281,11 +281,11 @@ class AMRCommNode:
         self.telemetry_sent += 1
         msg_id = f"TEL_{self.robot_id}_{now:.3f}"
         
-        pkt = LinkPacket(
+        pkt = MeshPacket(
             msg_id=msg_id,
             src=self.robot_id,
             forwarder=self.robot_id,
-            dst=BROADCAST,
+            dst=MESH_BROADCAST,
             ttl=3,
             msg_type="TELEMETRY",
             priority=2,
@@ -326,7 +326,7 @@ class AMRCommNode:
 
             # BRIDGE LOGIC (Wi-SUN -> Wi-Fi)
             if not self.in_dead_zone and pkt.msg_type == "TELEMETRY":
-                relay_pkt = LinkPacket(
+                relay_pkt = MeshPacket(
                     msg_id=f"RELAY_{pkt.msg_id}",
                     src=pkt.src,
                     forwarder=self.robot_id,
@@ -341,7 +341,7 @@ class AMRCommNode:
 
         return received_payloads
 
-    def handle_task_broadcast(self, task_pkt: LinkPacket, now: float):
+    def handle_task_broadcast(self, task_pkt: MeshPacket, now: float):
         """Designated Forwarder rule: Load-balanced Wi-Fi robot bridges server tasks to Wi-SUN."""
         if self.in_dead_zone:
             return
@@ -360,7 +360,7 @@ class AMRCommNode:
 
         if self.robot_id == designated_forwarder:
             for dz_robot in active_deadzone_robots:
-                bridge_pkt = LinkPacket(
+                bridge_pkt = MeshPacket(
                     msg_id=f"BRIDGE_TASK_{task_pkt.msg_id}_{dz_robot}",
                     src=task_pkt.src,
                     forwarder=self.robot_id,
@@ -377,7 +377,7 @@ class AMRCommNode:
 # 5. SERVER DASHBOARD
 # ==========================================
 class ServerDashboard:
-    def __init__(self, server_id: int, wifi_net: CommsMediator):
+    def __init__(self, server_id: int, wifi_net: RadioMedium):
         self.server_id = server_id
         self.wifi_net = wifi_net
         self.fleet_positions = {}
@@ -399,11 +399,11 @@ class ServerDashboard:
         
         self.last_task_broadcast = now
         msg_id = f"TASK_{now:.2f}"
-        pkt = LinkPacket(
+        pkt = MeshPacket(
             msg_id=msg_id,
             src=self.server_id,
             forwarder=self.server_id,
-            dst=BROADCAST,
+            dst=MESH_BROADCAST,
             ttl=4,
             msg_type="TASK_ASSIGNMENT",
             priority=1,
@@ -461,7 +461,7 @@ def run_hackathon_simulation(total_steps=120, print_progress=True):
 
     rng = random.Random(42)
     
-    wifi_net = CommsMediator(
+    wifi_net = RadioMedium(
         robot_ids=all_nodes, 
         rng=rng, 
         comm_range=60.0, 
@@ -469,10 +469,10 @@ def run_hackathon_simulation(total_steps=120, print_progress=True):
         latency_mean=0.010,
         name="Wi-Fi (802.11ax High-Speed)"
     )
-    dz = DeadZone(x0=15.0, y0=15.0, x1=45.0, y1=45.0, deliver_prob=0.0)
+    dz = RFDeadZone(x0=15.0, y0=15.0, x1=45.0, y1=45.0, deliver_prob=0.0)
     wifi_net.dead_zones.append(dz)
 
-    wisun_net = CommsMediator(
+    wisun_net = RadioMedium(
         robot_ids=all_nodes, 
         rng=rng, 
         comm_range=40.0, 

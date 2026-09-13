@@ -1,7 +1,7 @@
 import time
 from collections import deque
 import heapq
-from models import LinkPacket, BROADCAST
+from models import MeshPacket, MESH_BROADCAST
 
 class TelemetryExtractor:
     def __init__(self, robot_id: int):
@@ -67,7 +67,7 @@ class AMRCommNode:
     def get_congestion_score(self):
         return len(self.queue) / max(1, self.queue_capacity)
 
-    def queue_packet(self, pkt: LinkPacket):
+    def queue_packet(self, pkt: MeshPacket):
         if len(self.queue) >= self.queue_capacity:
             if self.on_event:
                 self.on_event("PACKET_DROPPED", pkt, reason="QUEUE_FULL", amr_id=self.robot_id)
@@ -91,11 +91,11 @@ class AMRCommNode:
         self.last_broadcast_time = now
         msg_id = f"TEL_{self.robot_id}_{now:.3f}"
         
-        pkt = LinkPacket(
+        pkt = MeshPacket(
             message_id=msg_id,
             origin_id=self.robot_id,
             forwarder_id=self.robot_id,
-            destination_id=BROADCAST,
+            destination_id=MESH_BROADCAST,
             ttl=3,
             hop_count=0,
             message_type="TELEMETRY",
@@ -109,7 +109,7 @@ class AMRCommNode:
 
     def create_task_packet(self, dst: int, task_data: dict, now: float):
         msg_id = f"TASK_{self.robot_id}_{now:.3f}"
-        pkt = LinkPacket(
+        pkt = MeshPacket(
             message_id=msg_id,
             origin_id=self.robot_id,
             forwarder_id=self.robot_id,
@@ -146,7 +146,7 @@ class AMRCommNode:
                 pkt.medium = "WISUN"
                 self.wisun_net.send(pkt, now)
             else:
-                if pkt.destination_id == BROADCAST:
+                if pkt.destination_id == MESH_BROADCAST:
                     has_wisun_peers = any(v == 'WISUN' for v in self.peer_interfaces.values())
                     if has_wisun_peers and pkt.medium == "WIFI": # Bridge WIFI -> WISUN
                         import copy
@@ -157,7 +157,7 @@ class AMRCommNode:
                             self.on_event("BRIDGE_SELECTED", pkt, amr_id=self.robot_id)
                     pkt.medium = "WIFI"
                     self.wifi_net.send(pkt, now)
-                elif pkt.destination_id != BROADCAST and self.peer_interfaces.get(pkt.destination_id) == 'WISUN':
+                elif pkt.destination_id != MESH_BROADCAST and self.peer_interfaces.get(pkt.destination_id) == 'WISUN':
                     pkt.medium = "WISUN"
                     self.wisun_net.send(pkt, now)
                     if self.on_event:
@@ -182,7 +182,7 @@ class AMRCommNode:
             self.peer_interfaces[pkt.origin_id] = 'WISUN'
             self._handle_received_packet(pkt, now)
             
-    def _handle_received_packet(self, pkt: LinkPacket, now: float):
+    def _handle_received_packet(self, pkt: MeshPacket, now: float):
         if self._is_duplicate(pkt.message_id):
             if self.on_event:
                 self.on_event("DUPLICATE_DROPPED", pkt, amr_id=self.robot_id)
@@ -194,12 +194,12 @@ class AMRCommNode:
             return
 
         # If it's meant for me or broadcast, process payload
-        if pkt.destination_id == self.robot_id or pkt.destination_id == BROADCAST:
+        if pkt.destination_id == self.robot_id or pkt.destination_id == MESH_BROADCAST:
             if pkt.message_type == "TASK":
                 if self.on_event:
                     self.on_event("TASK_RECEIVED", pkt, amr_id=self.robot_id)
                 # Auto-ACK
-                ack_pkt = LinkPacket(
+                ack_pkt = MeshPacket(
                     message_id=f"ACK_{pkt.message_id}",
                     origin_id=self.robot_id,
                     forwarder_id=self.robot_id,
@@ -216,7 +216,7 @@ class AMRCommNode:
                     self.on_event("ACK_RECEIVED", pkt, amr_id=self.robot_id)
 
         # Forwarding logic
-        if pkt.destination_id != self.robot_id and pkt.destination_id != BROADCAST:
+        if pkt.destination_id != self.robot_id and pkt.destination_id != MESH_BROADCAST:
             import copy
             fwd_pkt = copy.deepcopy(pkt)
             fwd_pkt.ttl -= 1
@@ -228,7 +228,7 @@ class AMRCommNode:
                 self.on_event("PACKET_FORWARDED", fwd_pkt, amr_id=self.robot_id)
                 
         # Bridge logic for TELEMETRY (Wi-SUN -> Wi-Fi)
-        elif pkt.destination_id == BROADCAST and pkt.message_type == "TELEMETRY":
+        elif pkt.destination_id == MESH_BROADCAST and pkt.message_type == "TELEMETRY":
             if not self.in_dead_zone and pkt.medium == "WISUN":
                 import copy
                 fwd_pkt = copy.deepcopy(pkt)
@@ -243,7 +243,7 @@ class AMRCommNode:
                     self.on_event("PACKET_FORWARDED", fwd_pkt, amr_id=self.robot_id)
 
         # Bridge logic for TASKS (Wi-Fi -> Wi-SUN)
-        elif pkt.destination_id == BROADCAST and pkt.message_type == "TASK":
+        elif pkt.destination_id == MESH_BROADCAST and pkt.message_type == "TASK":
             if not self.in_dead_zone and pkt.medium == "WIFI":
                 active_deadzone_robots = [r_id for r_id, iface in self.peer_interfaces.items() if iface == 'WISUN']
                 if active_deadzone_robots:

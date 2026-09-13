@@ -1,9 +1,9 @@
 import math
 import heapq
 import random
-from models import LinkPacket, BROADCAST
+from models import MeshPacket, MESH_BROADCAST
 
-class DeadZone:
+class RFDeadZone:
     def __init__(self, x0, y0, x1, y1):
         self.bounds = (x0, y0, x1, y1)
         
@@ -11,7 +11,7 @@ class DeadZone:
         x0, y0, x1, y1 = self.bounds
         return x0 <= x <= x1 and y0 <= y <= y1
 
-class CommsMediator:
+class RadioMedium:
     """Mock Network Physics Engine"""
     def __init__(self, robot_ids, rng, comm_range, loss_rate=0.0, latency_mean=0.0, name="NET", on_event=None):
         self.name = name
@@ -34,7 +34,7 @@ class CommsMediator:
     def is_in_dead_zone(self, x, y):
         return any(dz.contains(x, y) for dz in self.dead_zones)
         
-    def send(self, pkt: LinkPacket, now: float):
+    def send(self, pkt: MeshPacket, now: float):
         src_pos = self.positions.get(pkt.forwarder_id)
         if not src_pos:
             return
@@ -50,7 +50,7 @@ class CommsMediator:
             if r_id == pkt.forwarder_id:
                 continue
                 
-            if pkt.destination_id != BROADCAST and pkt.destination_id != r_id:
+            if pkt.destination_id != MESH_BROADCAST and pkt.destination_id != r_id:
                 continue
                 
             if self.dead_zones and self.is_in_dead_zone(*pos):
