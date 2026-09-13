@@ -1,0 +1,132 @@
+* {
+    box-sizing: border-box;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+body {
+    margin: 0;
+    padding: 0;
+    background-color: #1e1e1e;
+    color: #eee;
+}
+
+header {
+    background-color: #333;
+    padding: 10px 20px;
+    border-bottom: 2px solid #555;
+}
+
+h1 {
+    margin: 0;
+    font-size: 1.5rem;
+}
+
+.container {
+    display: flex;
+    flex-direction: row;
+    padding: 20px;
+    gap: 20px;
+    height: calc(100vh - 60px);
+}
+
+.left-column {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+.right-column {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+    overflow-y: hidden;
+}
+
+#warehouse-container {
+    background-color: #2a2a2a;
+    border: 2px solid #555;
+    border-radius: 8px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 10px;
+}
+
+canvas {
+    background-color: #111;
+    border: 1px solid #444;
+}
+
+.panel {
+    background-color: #2a2a2a;
+    border: 1px solid #444;
+    border-radius: 8px;
+    padding: 15px;
+}
+
+.panel h3 {
+    margin-top: 0;
+    margin-bottom: 10px;
+    border-bottom: 1px solid #444;
+    padding-bottom: 5px;
+    font-size: 1.1rem;
+}
+
+.event-log {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+#log-container {
+    flex: 1;
+    overflow-y: auto;
+    font-family: monospace;
+    font-size: 0.9rem;
+}
+
+.log-entry {
+    padding: 4px;
+    border-bottom: 1px solid #333;
+    cursor: pointer;
+}
+.log-entry:hover {
+    background-color: #3a3a3a;
+}
+
+.log-WIFI { color: #4ade80; }
+.log-WISUN { color: #60a5fa; }
+.log-DROP { color: #f87171; }
+.log-WARN { color: #fbbf24; }
+.log-INFO { color: #d1d5db; }
+
+button {
+    background-color: #4f46e5;
+    color: white;
+    border: none;
+    padding: 8px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+}
+button:hover {
+    background-color: #4338ca;
+}
+
+input, select {
+    background-color: #333;
+    color: white;
+    border: 1px solid #555;
+    padding: 5px;
+    border-radius: 4px;
+}
+
+pre {
+    margin: 0;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    font-size: 0.9rem;
+    color: #a78bfa;
+}

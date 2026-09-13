@@ -1,0 +1,4 @@
+# Stale sourceless bytecode shipped by upstream; wrong magic number for our Python.
+*.pyc
+*.pyc.bak
+__pycache__/

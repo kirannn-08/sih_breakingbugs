@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AMR Network & Map Simulation</title>
+    <style>
+        body { display: flex; margin: 0; height: 100vh; overflow: hidden; background-color: #f4f7f6; font-family: 'Segoe UI', sans-serif; }
+        #left-panel { flex: 1; position: relative; overflow: hidden; }
+        #right-panel { width: 380px; display: flex; flex-direction: column; background: #fff; border-left: 2px solid #ddd; padding: 10px; overflow-y: auto; box-sizing: border-box; }
+        canvas { display: block; }
+        
+        /* Original controls on the canvas */
+        #controls-overlay {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(255, 255, 255, 0.95);
+            padding: 15px;
+            border-radius: 12px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.15);
+            width: 250px;
+            z-index: 10;
+        }
+        #controls-overlay h2 { margin-top: 0; font-size: 1.1rem; color: #2c3e50; border-bottom: 2px solid #ecf0f1; padding-bottom: 5px;}
+        .legend-item { display: flex; align-items: center; margin-bottom: 8px; font-size: 0.85rem; color: #34495e; font-weight: 500;}
+        .swatch { width: 16px; height: 16px; border-radius: 4px; margin-right: 10px; flex-shrink: 0;}
+        .swatch.wifi { background: #3498db; }
+        .swatch.wisun { background: transparent; border: 2px dashed #e67e22; }
+        .swatch.server { background: #2c3e50; border-radius: 4px;}
+        .swatch.deadzone { background: rgba(231, 76, 60, 0.15); border: 2px dashed #e74c3c; }
+        .swatch.packet-wifi { background: #3498db; border-radius: 50%; width: 10px; height: 10px; margin-left: 3px; margin-right: 13px;}
+        .swatch.packet-wisun { background: #d35400; border-radius: 50%; width: 10px; height: 10px; margin-left: 3px; margin-right: 13px;}
+        .instruction { position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.7); color: white; padding: 10px 20px; border-radius: 20px; font-size: 0.9rem; pointer-events: none;}
+        
+        /* Right panel styling */
+        .panel { background: #fff; border: 1px solid #ccc; margin-bottom: 10px; border-radius: 5px; display: flex; flex-direction: column; min-height: 120px; }
+        .panel-header { padding: 5px 10px; font-weight: bold; font-size: 0.9rem; border-bottom: 1px solid #ccc; display: flex; justify-content: space-between; }
+        .panel-content { flex: 1; overflow-y: auto; padding: 5px; font-size: 0.75rem; font-family: Consolas, monospace; background: #fafafa;}
+        
+        .msg { padding: 4px; border-bottom: 1px dashed #eee; margin-bottom: 2px; }
+        .msg.wifi-wifi { color: #2980b9; } 
+        .msg.wisun-wisun { color: #d35400; } 
+        .msg.relay { color: #8e44ad; } 
+        .msg.server-broadcast { color: #27ae60; font-weight: bold; } 
+        
+        #task-generator { background: #ecf0f1; padding: 10px; border-radius: 5px; margin-bottom: 10px; border: 1px solid #bdc3c7; }
+        #task-generator h3 { margin: 0 0 10px 0; font-size: 1rem; color: #2c3e50; }
+        button { padding: 6px 12px; cursor: pointer; background: #3498db; color: white; border: none; border-radius: 3px; font-weight: bold; width: 100%; margin-top: 5px;}
+        button:hover { background: #2980b9; }
+        input[type="text"] { padding: 6px; width: 100%; box-sizing: border-box; border: 1px solid #ccc; border-radius: 3px; }
+    </style>
+</head>
+<body>
+
+    <div id="left-panel">
+        <div id="controls-overlay">
+            <h2>Network Topology</h2>
+            <div class="legend-item"><div class="swatch server"></div> Central Server (Wi-Fi AP)</div>
+            <div class="legend-item"><div class="swatch wifi"></div> Wi-Fi Connection</div>
+            <div class="legend-item"><div class="swatch wisun"></div> Wi-SUN Mesh (Hopping)</div>
+            <div class="legend-item"><div class="swatch deadzone"></div> Wi-Fi Deadzone</div>
+            <div style="border-top: 1px solid #ecf0f1; margin: 10px 0;"></div>
+            <div class="legend-item"><div class="swatch packet-wifi"></div> Wi-Fi Message</div>
+            <div class="legend-item"><div class="swatch packet-wisun"></div> Wi-SUN Message</div>
+        </div>
+        <div class="instruction">Drag the red Deadzone box to test network failover!</div>
+        <canvas id="sim"></canvas>
+    </div>
+    
+    <div id="right-panel">
+        <div id="task-generator">
+            <h3>Control Center</h3>
+            <input type="text" id="task-name" placeholder="Task (e.g. Move Pallet A to B)">
+            <button onclick="generateTask()">Broadcast Task Auction</button>
+        </div>
+        
+        <div class="panel" style="flex: 1.5;">
+            <div class="panel-header" style="background:#2c3e50; color:white;">Central Server Log</div>
+            <div class="panel-content" id="log-server"></div>
+        </div>
+        <div class="panel">
+            <div class="panel-header" style="background:#3498db; color:white;">AMR 1 Log</div>
+            <div class="panel-content" id="log-amr-0"></div>
+        </div>
+        <div class="panel">
+            <div class="panel-header" style="background:#2ecc71; color:white;">AMR 2 Log</div>
+            <div class="panel-content" id="log-amr-1"></div>
+        </div>
+        <div class="panel">
+            <div class="panel-header" style="background:#e67e22; color:white;">AMR 3 Log</div>
+            <div class="panel-content" id="log-amr-2"></div>
+        </div>
+        <div class="panel">
+            <div class="panel-header" style="background:#e74c3c; color:white;">AMR 4 Log</div>
+            <div class="panel-content" id="log-amr-3"></div>
+        </div>
+        <div class="panel">
+            <div class="panel-header" style="background:#9b59b6; color:white;">AMR 5 Log</div>
+            <div class="panel-content" id="log-amr-4"></div>
+        </div>
+        <div class="panel">
+            <div class="panel-header" style="background:#34495e; color:white;">AMR 6 Log</div>
+            <div class="panel-content" id="log-amr-5"></div>
+        </div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('sim');
+        const ctx = canvas.getContext('2d');
+        const leftPanel = document.getElementById('left-panel');
+        
+        let width, height;
+        function resize() {
+            width = leftPanel.clientWidth;
+            height = leftPanel.clientHeight;
+            canvas.width = width;
+            canvas.height = height;
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        // Environment Map config (Image 1 replica)
+        const cols = 6;
+        const colWidth = 160;
+        const startX = 120;
+        
+        const server = { x: width / 2, y: 40, w: 160, h: 50 };
+        const deadzone = { x: width / 2 - 150, y: height / 2, w: 400, h: 300, isDragging: false, offsetX: 0, offsetY: 0 };
+        
+        const amrs = [];
+        const numAMRs = 6;
+        const packets = [];
+        
+        // Waypoint graph for continuous linear movement around blue walls (racks)
+        // Ensure paths correspond exactly to the layout shown in the original template image
+        const gridX = [60, 200, 440, 680, 840]; // Aisle vertical paths
+        const gridY = [220, 410, 630]; // Aisle horizontal paths
+        const nodes = [];
+        gridX.forEach((x, i) => {
+            gridY.forEach((y, j) => {
+                nodes.push({x, y, i, j});
+            });
+        });
+        
+        function getNeighbors(node) {
+            return nodes.filter(n => {
+                let dx = Math.abs(n.i - node.i);
+                let dy = Math.abs(n.j - node.j);
+                return (dx === 1 && dy === 0) || (dx === 0 && dy === 1);
+            });
+        }
+        
+        function logMessage(panelId, sender, receiver, msg, type) {
+            const panel = document.getElementById(panelId);
+            if(!panel) return;
+            const div = document.createElement('div');
+            div.className = `msg ${type}`;
+            const time = new Date().toLocaleTimeString();
+            div.innerHTML = `[${time}] <b>${sender} &rarr; ${receiver}:</b> ${msg}`;
+            panel.appendChild(div);
+            panel.scrollTop = panel.scrollHeight;
+        }
+        
+        class AMR {
+            constructor(id) {
+                this.id = id;
+                this.currentNode = nodes[Math.floor(Math.random() * nodes.length)];
+                this.targetNode = this.pickRandomNeighbor(this.currentNode);
+                this.x = this.currentNode.x;
+                this.y = this.currentNode.y;
+                
+                this.speed = 2.0 + Math.random() * 1.5;
+                this.battery = 100;
+                this.currentTask = 'Idle';
+                
+                const colors = ['#3498db', '#2ecc71', '#e67e22', '#e74c3c', '#9b59b6', '#34495e'];
+                this.color = colors[id % colors.length];
+                
+                this.inDeadzone = false;
+                this.connectedTo = null;
+                this.connectionType = 'none';
+                this.isBridge = false;
+                
+                this.ripples = []; // For concentric P2P waves
+            }
+            
+            pickRandomNeighbor(node, excludeNode = null) {
+                let neighbors = getNeighbors(node);
+                if (excludeNode && neighbors.length > 1) {
+                    neighbors = neighbors.filter(n => n !== excludeNode);
+                }
+                return neighbors[Math.floor(Math.random() * neighbors.length)];
+            }
+            
+            update() {
+                this.battery -= 0.005;
+                if (this.battery < 0) this.battery = 100;
+                
+                let dx = this.targetNode.x - this.x;
+                let dy = this.targetNode.y - this.y;
+                let dist = Math.hypot(dx, dy);
+                
+                // --- Collision Avoidance (No passing through!) ---
+                let canMove = true;
+                for (let other of amrs) {
+                    if (other.id !== this.id) {
+                        let odx = other.x - this.x;
+                        let ody = other.y - this.y;
+                        let odist = Math.hypot(odx, ody);
+                        
+                        if (odist < 90 && odist > 0) {
+                            // Check if they are in front of us
+                            let dot = (dx * odx + dy * ody) / (dist * odist);
+                            if (dot > 0) {
+                                // They are in front! Check if they are moving towards us (head-on collision)
+                                let other_dx = other.targetNode.x - other.x;
+                                let other_dy = other.targetNode.y - other.y;
+                                let moving_towards = (dx * other_dx + dy * other_dy) < -0.5;
+                                
+                                if (moving_towards) {
+                                    // Head-on! We both bounce back / reverse direction to keep continuous motion
+                                    let temp = this.currentNode;
+                                    this.currentNode = this.targetNode;
+                                    this.targetNode = temp;
+                                    
+                                    let otemp = other.currentNode;
+                                    other.currentNode = other.targetNode;
+                                    other.targetNode = otemp;
+                                    canMove = false;
+                                } else {
+                                    // They are moving same way but are slower, so we slow down (wait)
+                                    if (odist < 75) {
+                                        canMove = false;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                if (canMove) {
+                    if (dist < this.speed) {
+                        this.x = this.targetNode.x;
+                        this.y = this.targetNode.y;
+                        let prevNode = this.currentNode;
+                        this.currentNode = this.targetNode;
+                        this.targetNode = this.pickRandomNeighbor(this.currentNode, prevNode);
+                    } else {
+                        this.x += (dx / dist) * this.speed;
+                        this.y += (dy / dist) * this.speed;
+                    }
+                }
+                
+                this.inDeadzone = (this.x > deadzone.x && this.x < deadzone.x + deadzone.w &&
+                                   this.y > deadzone.y && this.y < deadzone.y + deadzone.h);
+                                   
+                // Update ripples
+                this.ripples.forEach(r => r.radius += 1.5);
+                this.ripples = this.ripples.filter(r => r.radius < r.maxRadius);
+            }
+            
+            draw() {
+                ctx.save();
+                ctx.translate(this.x, this.y);
+                
+                // Draw Concentric P2P Ripples
+                this.ripples.forEach(r => {
+                    ctx.beginPath();
+                    ctx.arc(0, 0, r.radius, 0, Math.PI*2);
+                    let alpha = 1 - (r.radius / r.maxRadius);
+                    ctx.strokeStyle = this.inDeadzone ? `rgba(230, 126, 34, ${alpha})` : `rgba(52, 152, 219, ${alpha})`;
+                    ctx.lineWidth = 2;
+                    ctx.stroke();
+                });
+                
+                let angle = Math.atan2(this.targetNode.y - this.y, this.targetNode.x - this.x);
+                ctx.rotate(angle);
+                
+                // AMR Body
+                ctx.fillStyle = this.color;
+                ctx.beginPath();
+                ctx.roundRect(-15, -20, 30, 40, 5);
+                ctx.fill();
+                
+                // Front indicator
+                ctx.fillStyle = '#fff';
+                ctx.beginPath();
+                ctx.moveTo(5, -10);
+                ctx.lineTo(12, 0);
+                ctx.lineTo(5, 10);
+                ctx.fill();
+                
+                ctx.restore();
+                
+                // ID Label and Status
+                ctx.fillStyle = '#333';
+                ctx.font = 'bold 12px Arial';
+                ctx.textAlign = 'center';
+                ctx.fillText(`AMR ${this.id + 1}`, this.x, this.y - 25);
+                
+                // Network Status icon
+                ctx.beginPath();
+                ctx.arc(this.x + 20, this.y - 25, 6, 0, Math.PI*2);
+                if (this.connectionType === 'wifi') ctx.fillStyle = '#3498db';
+                else if (this.connectionType === 'wisun') ctx.fillStyle = '#e67e22';
+                else ctx.fillStyle = '#e74c3c'; 
+                ctx.fill();
+                ctx.strokeStyle = '#fff';
+                ctx.lineWidth = 1;
+                ctx.stroke();
+                
+                if (this.isBridge) {
+                    ctx.fillStyle = '#f1c40f';
+                    ctx.font = 'bold 10px Arial';
+                    ctx.fillText('BRIDGE', this.x, this.y + 30);
+                }
+            }
+        }
+        
+        for (let i = 0; i < numAMRs; i++) amrs.push(new AMR(i));
+
+        function calculateNetwork() {
+            amrs.forEach(a => { a.connectedTo = null; a.connectionType = 'none'; a.isBridge = false; });
+            let wifiNodes = [];
+            
+            amrs.forEach(a => {
+                if (!a.inDeadzone) {
+                    a.connectedTo = 'server';
+                    a.connectionType = 'wifi';
+                    wifiNodes.push(a);
+                }
+            });
+            
+            amrs.forEach(a => {
+                if (a.inDeadzone) {
+                    let bestBridge = null;
+                    let minDist = Infinity;
+                    wifiNodes.forEach(w => {
+                        let d = Math.hypot(a.x - w.x, a.y - w.y);
+                        if (d < minDist && d < 600) { minDist = d; bestBridge = w; }
+                    });
+                    
+                    if (bestBridge) {
+                        a.connectedTo = bestBridge;
+                        a.connectionType = 'wisun';
+                        bestBridge.isBridge = true;
+                    } else {
+                        let bestHop = null;
+                        let minHopDist = Infinity;
+                        amrs.forEach(other => {
+                            if (other !== a && other.inDeadzone && other.connectionType === 'wisun') {
+                                let d = Math.hypot(a.x - other.x, a.y - other.y);
+                                if (d < minHopDist && d < 300) { minHopDist = d; bestHop = other; }
+                            }
+                        });
+                        if (bestHop) {
+                            a.connectedTo = bestHop;
+                            a.connectionType = 'wisun';
+                        }
+                    }
+                }
+            });
+        }
+        
+        function drawMap() {
+            ctx.strokeStyle = 'rgba(189, 195, 199, 0.3)';
+            ctx.lineWidth = 1;
+            for (let i = 0; i < width; i += 40) {
+                ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, height); ctx.stroke();
+            }
+            for (let i = 0; i < height; i += 40) {
+                ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(width, i); ctx.stroke();
+            }
+            
+            ctx.fillStyle = '#2c3e50';
+            ctx.beginPath();
+            ctx.roundRect(server.x - server.w/2, server.y - server.h/2, server.w, server.h, 10);
+            ctx.fill();
+            ctx.fillStyle = '#ecf0f1';
+            ctx.font = 'bold 16px Arial';
+            ctx.textAlign = 'center';
+            ctx.fillText('CENTRAL LIVE TASK SERVER', server.x, server.y + 6);
+            
+            for (let i = 0; i < 6; i++) {
+                let x = startX + i * colWidth;
+                let y = 130;
+                let grad = ctx.createRadialGradient(x, y, 10, x, y, 25);
+                grad.addColorStop(0, 'rgba(230, 126, 34, 0.5)');
+                grad.addColorStop(1, 'rgba(230, 126, 34, 0)');
+                ctx.fillStyle = grad;
+                ctx.beginPath(); ctx.arc(x, y, 25, 0, Math.PI*2); ctx.fill();
+                
+                ctx.fillStyle = '#d35400';
+                ctx.beginPath(); ctx.arc(x, y, 16, 0, Math.PI*2); ctx.fill();
+                ctx.fillStyle = '#fff'; ctx.font = 'bold 12px Arial'; ctx.fillText('\u26A1', x, y+4);
+                ctx.fillStyle = '#333'; ctx.fillText(`C${i+1}`, x, y + 40);
+            }
+            
+            // Original Template Rack Layout (Blue Walls)
+            ctx.fillStyle = '#ecf0f1';
+            ctx.strokeStyle = '#bdc3c7';
+            ctx.lineWidth = 2;
+            
+            const drawRack = (x, y) => {
+                const w = 70; const h = 120;
+                ctx.beginPath();
+                ctx.rect(x - w/2, y - h/2, w, h);
+                ctx.fill();
+                ctx.stroke();
+                
+                ctx.beginPath();
+                for(let i=1; i<3; i++) { ctx.moveTo(x - w/2 + i*23.3, y - h/2); ctx.lineTo(x - w/2 + i*23.3, y + h/2); }
+                for(let i=1; i<5; i++) { ctx.moveTo(x - w/2, y - h/2 + i*24); ctx.lineTo(x + w/2, y - h/2 + i*24); }
+                ctx.stroke();
+                
+                ctx.strokeStyle = '#3498db';
+                ctx.setLineDash([4, 4]);
+                ctx.strokeRect(x - w/2 - 18, y - 10, 18, 20);
+                ctx.strokeRect(x + w/2, y - 10, 18, 20);
+                ctx.setLineDash([]);
+                
+                ctx.fillStyle = '#3498db';
+                ctx.font = '9px Arial';
+                ctx.fillText('BAY', x - w/2 - 9, y + 3);
+                ctx.fillText('BAY', x + w/2 + 9, y + 3);
+                ctx.strokeStyle = '#bdc3c7'; 
+            };
+            
+            for (let row = 0; row < 2; row++) {
+                for (let col = 0; col < 6; col++) {
+                    if (col === 2 || col === 5) continue; 
+                    drawRack(startX + col * colWidth, 300 + row * 220);
+                }
+            }
+            
+            const drawPark = (x, y, label) => {
+                ctx.fillStyle = 'rgba(52, 152, 219, 0.2)';
+                ctx.beginPath(); ctx.arc(x, y, 22, 0, Math.PI*2); ctx.fill();
+                ctx.fillStyle = '#3498db';
+                ctx.beginPath(); ctx.arc(x, y, 15, 0, Math.PI*2); ctx.fill();
+                ctx.fillStyle = '#fff'; ctx.font = 'bold 12px Arial'; ctx.fillText('P', x, y+4);
+                ctx.fillStyle = '#333'; ctx.fillText(label, x, y+35);
+            };
+            drawPark(startX + 1 * colWidth + colWidth/2, 280, 'P1');
+            drawPark(startX + 3 * colWidth + colWidth/2, 280, 'P3');
+            drawPark(startX + 1 * colWidth + colWidth/2, 500, 'P2');
+            drawPark(startX + 3 * colWidth + colWidth/2, 500, 'P4');
+            
+            ctx.fillStyle = 'rgba(46, 204, 113, 0.2)';
+            ctx.beginPath(); ctx.arc(60, height - 80, 25, 0, Math.PI*2); ctx.fill();
+            ctx.fillStyle = '#2ecc71';
+            ctx.beginPath(); ctx.arc(60, height - 80, 16, 0, Math.PI*2); ctx.fill();
+            ctx.fillStyle = '#fff'; ctx.font = 'bold 14px Arial'; ctx.fillText('D', 60, height - 75);
+            ctx.fillStyle = '#333'; ctx.fillText('D1', 60, height - 40);
+        }
+        
+        function drawDeadzone() {
+            ctx.fillStyle = 'rgba(231, 76, 60, 0.15)';
+            ctx.fillRect(deadzone.x, deadzone.y, deadzone.w, deadzone.h);
+            
+            ctx.strokeStyle = '#e74c3c';
+            ctx.lineWidth = 3;
+            ctx.setLineDash([10, 10]);
+            ctx.strokeRect(deadzone.x, deadzone.y, deadzone.w, deadzone.h);
+            ctx.setLineDash([]);
+            
+            ctx.fillStyle = '#c0392b';
+            ctx.font = 'bold 18px Arial';
+            ctx.textAlign = 'center';
+            ctx.fillText('\u26A0\uFE0F WI-FI DEADZONE', deadzone.x + deadzone.w/2, deadzone.y + 35);
+            ctx.font = '13px Arial';
+            ctx.fillText('Force Wi-SUN Mesh Routing', deadzone.x + deadzone.w/2, deadzone.y + 55);
+        }
+        
+        function spawnPacket(src, dest, type) {
+            let targetObj = dest === 'server' ? {x: server.x, y: server.y + server.h/2} : dest;
+            packets.push({
+                x: src.x, y: src.y,
+                startX: src.x, startY: src.y,
+                target: targetObj,
+                progress: 0,
+                speed: 0.015 + Math.random() * 0.01,
+                type: type,
+                id: Math.random()
+            });
+        }
+        
+        function updateNetworkVisuals() {
+            amrs.forEach(a => {
+                if (a.connectedTo) {
+                    let targetObj = a.connectedTo === 'server' ? {x: server.x, y: server.y + server.h/2} : a.connectedTo;
+                    ctx.beginPath();
+                    ctx.moveTo(a.x, a.y);
+                    ctx.lineTo(targetObj.x, targetObj.y);
+                    
+                    if (a.connectionType === 'wifi') {
+                        ctx.strokeStyle = 'rgba(52, 152, 219, 0.8)';
+                        ctx.lineWidth = 3;
+                        ctx.setLineDash([]);
+                        ctx.stroke();
+                    } else if (a.connectionType === 'wisun') {
+                        ctx.strokeStyle = 'rgba(230, 126, 34, 1.0)';
+                        ctx.lineWidth = 3;
+                        ctx.setLineDash([12, 8]);
+                        ctx.stroke();
+                        ctx.setLineDash([]);
+                    }
+                    
+                    if (Math.random() < 0.012) {
+                        spawnPacket(a, a.connectedTo, a.connectionType);
+                        if (a.connectionType === 'wisun' && a.connectedTo !== 'server') {
+                            let bridge = a.connectedTo;
+                            setTimeout(() => {
+                                if (bridge && bridge.connectedTo) {
+                                    spawnPacket(bridge, bridge.connectedTo, bridge.connectionType);
+                                }
+                            }, 1200); 
+                        }
+                    }
+                }
+            });
+            
+            for (let i = packets.length - 1; i >= 0; i--) {
+                let p = packets[i];
+                p.progress += p.speed;
+                if (p.progress >= 1) {
+                    packets.splice(i, 1);
+                    continue;
+                }
+                
+                p.x = p.startX + (p.target.x - p.startX) * p.progress;
+                p.y = p.startY + (p.target.y - p.startY) * p.progress;
+                
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, 6, 0, Math.PI*2);
+                ctx.fillStyle = p.type === 'wifi' ? '#3498db' : '#d35400';
+                ctx.fill();
+                ctx.strokeStyle = '#fff';
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+                
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, 12, 0, Math.PI*2);
+                ctx.fillStyle = p.type === 'wifi' ? 'rgba(52, 152, 219, 0.3)' : 'rgba(211, 84, 0, 0.3)';
+                ctx.fill();
+            }
+        }
+
+        function loop() {
+            ctx.clearRect(0, 0, width, height);
+            
+            drawMap();
+            drawDeadzone();
+            
+            amrs.forEach(a => a.update());
+            calculateNetwork();
+            
+            updateNetworkVisuals();
+            
+            amrs.forEach(a => a.draw());
+            
+            requestAnimationFrame(loop);
+        }
+        
+        loop();
+
+        leftPanel.addEventListener('mousedown', e => {
+            if (e.button !== 0) return;
+            let mx = e.clientX, my = e.clientY;
+            if (mx > deadzone.x && mx < deadzone.x + deadzone.w &&
+                my > deadzone.y && my < deadzone.y + deadzone.h) {
+                deadzone.isDragging = true;
+                deadzone.offsetX = mx - deadzone.x;
+                deadzone.offsetY = my - deadzone.y;
+            }
+        });
+        window.addEventListener('mousemove', e => {
+            if (deadzone.isDragging) {
+                deadzone.x = e.clientX - deadzone.offsetX;
+                deadzone.y = e.clientY - deadzone.offsetY;
+            }
+        });
+        window.addEventListener('mouseup', () => {
+            deadzone.isDragging = false;
+        });
+
+        // Intra-AMR P2P Messaging Logic - highly frequent to show communication in same region
+        setInterval(() => {
+            let sender = amrs[Math.floor(Math.random() * amrs.length)];
+            
+            // Add concentric ripple to sender to visualize broadcast
+            sender.ripples.push({ radius: 10, maxRadius: 120 });
+            
+            let candidates = amrs.filter(a => a.id !== sender.id && a.inDeadzone === sender.inDeadzone);
+            if(candidates.length > 0) {
+                let receiver = candidates[Math.floor(Math.random() * candidates.length)];
+                let type = sender.inDeadzone ? 'wisun-wisun' : 'wifi-wifi';
+                let payload = `Pos:(${Math.round(sender.x)},${Math.round(sender.y)}) | Vel:${sender.speed.toFixed(1)} | Bat:${Math.round(sender.battery)}% | Task:${sender.currentTask} | Dest:(${receiver.targetNode.x},${receiver.targetNode.y}) | Wi-Fi:${sender.inDeadzone ? 'OFF':'ON'} | Wi-SUN:${sender.inDeadzone ? 'Tx':'Idle'}`;
+                
+                logMessage(`log-amr-${receiver.id}`, `AMR ${sender.id+1}`, `AMR ${receiver.id+1}`, payload, type);
+                logMessage(`log-amr-${sender.id}`, `AMR ${sender.id+1}`, `AMR ${receiver.id+1}`, payload, type);
+                
+                spawnPacket(sender, receiver, sender.inDeadzone ? 'wisun' : 'wifi');
+            }
+        }, 1200);
+
+        window.generateTask = function() {
+            let taskName = document.getElementById('task-name').value || 'Transport Pallet';
+            let taskDetails = `Auction [Task: ${taskName}]`;
+            
+            logMessage('log-server', 'Server', 'ALL AMRs', taskDetails, 'server-broadcast');
+            
+            amrs.forEach(a => {
+                if (!a.inDeadzone) {
+                    logMessage(`log-amr-${a.id}`, 'Server', `AMR ${a.id+1}`, taskDetails, 'server-broadcast');
+                    spawnPacket(server, a, 'wifi');
+                } else {
+                    let bridge = a.connectedTo;
+                    if (bridge) {
+                        logMessage(`log-amr-${bridge.id}`, 'Server', `AMR ${a.id+1} (Fwd)`, `Relaying ${taskDetails}`, 'relay');
+                        logMessage(`log-amr-${a.id}`, `AMR ${bridge.id+1}`, `AMR ${a.id+1} [Orig: AMR ${a.id+1}]`, taskDetails, 'server-broadcast');
+                        spawnPacket(server, bridge, 'wifi');
+                        setTimeout(() => spawnPacket(bridge, a, 'wisun'), 800);
+                    }
+                }
+            });
+            
+            setTimeout(() => {
+                let acceptor = amrs[Math.floor(Math.random() * amrs.length)];
+                acceptor.currentTask = taskName;
+                
+                // Explicitly log the allotment in the server panel
+                let allotmentMsg = `[ASSIGNMENT] Task '${taskName}' has been allotted to AMR ${acceptor.id+1}`;
+                logMessage('log-server', 'Server System', 'Log', allotmentMsg, 'server-broadcast');
+                
+                let replyMsg = `Task accepted by: Machine ID ${acceptor.id+1}`;
+                if (!acceptor.inDeadzone) {
+                    logMessage(`log-amr-${acceptor.id}`, `AMR ${acceptor.id+1}`, 'Server', replyMsg, 'wifi-wifi');
+                    logMessage('log-server', `AMR ${acceptor.id+1}`, 'Server', replyMsg, 'wifi-wifi');
+                    spawnPacket(acceptor, server, 'wifi');
+                } else {
+                    let bridge = acceptor.connectedTo;
+                    if (bridge) {
+                        logMessage(`log-amr-${acceptor.id}`, `AMR ${acceptor.id+1}`, `Server`, replyMsg, 'relay');
+                        logMessage(`log-amr-${bridge.id}`, `AMR ${acceptor.id+1}`, `Server [Orig: Server]`, `Fwd: ${replyMsg}`, 'relay');
+                        logMessage('log-server', `AMR ${acceptor.id+1} (via Relay ${bridge.id+1})`, 'Server', replyMsg, 'relay');
+                        spawnPacket(acceptor, bridge, 'wisun');
+                        setTimeout(() => spawnPacket(bridge, server, 'wifi'), 800);
+                    }
+                }
+            }, 3000);
+        };
+    </script>
+</body>
+</html>
