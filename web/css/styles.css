@@ -856,3 +856,18 @@ canvas#simCanvas {
 ::-webkit-scrollbar-thumb:hover {
   background: #94a3b8;
 }
+
+/* Comms workstream link in the topbar. Deeper than --accent-amber (#d97706)
+   because white on that is only 3.2:1 -- under AA for 13px bold. This is 5.0:1. */
+.btn-amber {
+  background: #b45309;
+  border-color: #b45309;
+  color: #ffffff;
+  text-decoration: none;
+}
+
+.btn-amber:hover {
+  background: #92400e;
+  border-color: #92400e;
+  color: #ffffff;
+}

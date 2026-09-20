@@ -5,6 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>AMR Fleet Mission Control — SIH PS 26123</title>
   <link rel="stylesheet" href="css/styles.css">
+  <!-- "local" = simulation runs in this tab (static hosting, one sim per
+       visitor, resets on refresh). Set to "server" to use dashboard_server.py. -->
+  <script>window.AMR_BACKEND = "local";</script>
+  <script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%2306b6d4'><path d='M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5'/></svg>">
 </head>
 <body>
@@ -55,6 +59,13 @@
         <input type="checkbox" id="autoTasksCheck" checked onchange="window.app.toggleAutoTasks(this.checked)">
         <span>Auto-Tasks</span>
       </label>
+
+      <!-- Comms workstream: a SEPARATE network simulation, opened in its own
+           tab so it gets a full viewport and this page keeps its WebSocket. -->
+      <a id="btnCommsDemo" class="btn btn-amber" href="/comms/" target="_blank" rel="noopener"
+         title="Wi-SUN / Wi-Fi mesh comms workstream - an independent simulation">
+        Try the Communication Protocol Window
+      </a>
     </div>
   </header>
 
@@ -427,6 +438,7 @@
 
   <!-- Scripts -->
   <script src="js/renderer.js"></script>
+  <script src="js/pyodide_bridge.js"></script>
   <script src="js/app.js"></script>
 </body>
 </html>

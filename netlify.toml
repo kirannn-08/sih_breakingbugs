@@ -1,0 +1,9 @@
+[build]
+  publish = "web"
+  command = "bash netlify_build.sh"
+
+# Pyodide fetches its wasm from the CDN; the .py modules are served from here.
+[[headers]]
+  for = "/py/*"
+  [headers.values]
+    Content-Type = "text/plain; charset=utf-8"

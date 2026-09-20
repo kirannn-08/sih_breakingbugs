@@ -27,6 +27,18 @@ class AppController {
 
     this.updateConnectionStatus(false, "Connecting...");
 
+    // "local" runs the Python simulation in this tab (static hosting, one
+    // simulation per visitor). "server" talks to dashboard_server.py. Both
+    // speak the identical message vocabulary, so only the transport differs.
+    if (window.AMR_BACKEND === "local") {
+      this.socket = new window.LocalSimTransport(
+        (msg) => this.updateConnectionStatus(false, msg)
+      );
+      this.socket.onopen = () => this.updateConnectionStatus(true, "LOCAL SIM");
+      this.socket.onmessage = (event) => this.handleTransportMessage(event);
+      return;
+    }
+
     try {
       this.socket = new WebSocket(wsUrl);
 
@@ -71,6 +83,24 @@ class AppController {
       if (!this.reconnectTimer) {
         this.reconnectTimer = setTimeout(() => this.connectWebSocket(), 3000);
       }
+    }
+  }
+
+  handleTransportMessage(event) {
+    try {
+      const msg = JSON.parse(event.data);
+      if (msg.type === "init") {
+        this.mapData = msg.map;
+        this.renderer.setMap(msg.map);
+        this.populateTaskNodeOptions(msg.map.nodes);
+        this.handleStateUpdate(msg.state);
+      } else if (msg.type === "state") {
+        this.handleStateUpdate(msg.state);
+      } else if (msg.type === "scenario_result") {
+        this.handleScenarioResult(msg.data);
+      }
+    } catch (e) {
+      console.error("Failed to parse simulation message", e);
     }
   }
 

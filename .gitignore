@@ -10,3 +10,7 @@ venv/
 # `python3 synth_data.py`. The trained model (deadlock_net.npz) and the
 # result CSVs under results/ ARE committed -- they are the deliverable.
 data/
+
+# Netlify build artifacts (assembled by netlify_build.sh)
+web/py/
+web/comms/
